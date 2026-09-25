@@ -1,0 +1,18 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# Backup / archive
+*.zip
+*.rar
+*.7z
+
+# OS
+Thumbs.db
+Desktop.ini
+*.orig
