@@ -142,12 +142,25 @@ WeatherData calibrateWeather(const WeatherData& in);
 void publishWeather();
 
 // ==================== PINY CC1101 ====================
-#define PIN_CS   10
-#define PIN_SCK  12
-#define PIN_MISO 13
-#define PIN_MOSI 11
-#define PIN_GDO0 5
-#define PIN_GDO2 6
+// Klasyczny ESP32 WROOM: GPIO 6..11 są zajęte przez wewnętrzny flash,
+// więc piny muszą być inne niż na ESP32-S3 (patrz README).
+#ifdef BOARD_WROOM
+  // ESP32 (WROOM / DevKitC v4) — magistrala VSPI
+  #define PIN_CS   5
+  #define PIN_SCK  18
+  #define PIN_MISO 19
+  #define PIN_MOSI 23
+  #define PIN_GDO0 4
+  #define PIN_GDO2 16
+#else
+  // ESP32-S3 (DevKitC-1)
+  #define PIN_CS   10
+  #define PIN_SCK  12
+  #define PIN_MISO 13
+  #define PIN_MOSI 11
+  #define PIN_GDO0 5
+  #define PIN_GDO2 6
+#endif
 
 // ==================== PARAMETRY SKANOWANIA ====================
 const unsigned long COMBO_DWELL_MS = 1000;  // czas na kombinację (freq x profil)
@@ -1769,8 +1782,15 @@ void handleRoot() {
     html += R"(<div style="background:#3a1a1a;border:1px solid #ff6b6b;padding:14px;border-radius:8px;color:#ffb3b3;margin-bottom:14px">
       <b>Moduł radiowy CC1101 nie odpowiada po SPI</b> (VERSION=0x)";
     html += String(radioVersion, HEX);
-    html += R"( zamiast 0x14). Sprawdź połączenia: zasilanie 3.3 V, GND, SCK=GPIO12,
-      MISO=GPIO13, MOSI=GPIO11, CS=GPIO10. Bez poprawnego połączenia nic nie zostanie
+    html += R"( zamiast 0x14). Sprawdź połączenia: zasilanie 3.3 V, GND, SCK=GPIO)";
+    html += String(PIN_SCK);
+    html += R"(, MISO=GPIO)";
+    html += String(PIN_MISO);
+    html += R"(, MOSI=GPIO)";
+    html += String(PIN_MOSI);
+    html += R"(, CS=GPIO)";
+    html += String(PIN_CS);
+    html += R"(. Bez poprawnego połączenia nic nie zostanie
       odebrane, niezależnie od ustawień.
     </div>)";
   } else if (radioVersionHits < radioVersionSamples) {

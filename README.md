@@ -62,10 +62,13 @@ flaga baterii oraz ID nadajnika.
 
 ### Sprzęt i podłączenie
 
-- **ESP32-S3** (DevKitC-1, 8 MB flash)
-- Moduł **CC1101 868 MHz**
+Obsługiwane dwie płytki: **ESP32-S3** (DevKitC-1, 8 MB flash) oraz klasyczny
+**ESP32 WROOM-32** (4 MB flash, bez PSRAM). Firmware działa na obu — bez PSRAM,
+bo zużywa tylko ~55 kB RAM (wewnętrzna pamięć wystarcza z dużym zapasem).
 
-Podłączenie (nie zmieniaj!):
+Moduł **CC1101 868 MHz**.
+
+#### ESP32-S3 (DevKitC-1)
 
 | CC1101 | ESP32-S3 |
 |---|---|
@@ -78,6 +81,22 @@ Podłączenie (nie zmieniaj!):
 | VCC   | 3.3 V  |
 | GND   | GND    |
 
+#### ESP32 WROOM-32 (DevKitC v4)
+
+> **Uwaga:** na klasycznym ESP32 piny GPIO 6–11 są zajęte przez wewnętrzny flash,
+> więc podłączenie jest INNE niż na S3.
+
+| CC1101 | ESP32 WROOM | (odpowiednik S3) |
+|---|---|---|
+| CSN   | GPIO5  | 10 → 5  |
+| SCK   | GPIO18 | 12 → 18 |
+| MISO/SO | GPIO19 | 13 → 19 |
+| MOSI/SI | GPIO23 | 11 → 23 |
+| GDO0  | GPIO4  | 5 → 4   |
+| GDO2  | GPIO16 | 6 → 16  |
+| VCC   | 3.3 V  | —       |
+| GND   | GND    | —       |
+
 SPI: 1 MHz, tryb 0, magistrala VSPI. Antena CC1101 powinna być ustawiona pionowo,
 z dala od ESP32 (ESP32 z WiFi generuje szumy) i z dala od metalowych elementów.
 Przy dłuższych przewodach zasilających dodaj kondensator 100 nF (i opcjonalnie 47–100 µF)
@@ -85,16 +104,20 @@ tuż przy pinach VCC–GND modułu.
 
 ### Budowanie i wgrywanie
 
-Wymagania: [PlatformIO](https://platformio.org/) (projekt skonfigurowany dla płyty
-`esp32-s3-devkitc-1`, framework Arduino).
+Wymagania: [PlatformIO](https://platformio.org/) (framework Arduino).
 
 ```powershell
-# budowanie
+# ESP32-S3 (domyślne)
 pio run
-
-# wgranie (port COM12 — zmień w platformio.ini jeśli trzeba)
 pio run -t upload
+
+# ESP32 WROOM-32 (4 MB, bez PSRAM)
+pio run -e esp32-wroom
+pio run -e esp32-wroom -t upload
 ```
+
+Port USB ustaw w `platformio.ini` (`upload_port` / `monitor_port`), jeśli urządzenie
+dostaje inny port niż `COM12`.
 
 ### Konfiguracja sieci
 
@@ -172,10 +195,13 @@ The station transmits: temperature, humidity, average wind speed, wind gust, win
 
 ### Hardware & wiring
 
-- **ESP32-S3** (DevKitC-1, 8 MB flash)
-- **CC1101 868 MHz** module
+Two boards are supported: **ESP32-S3** (DevKitC-1, 8 MB flash) and the classic
+**ESP32 WROOM-32** (4 MB flash, no PSRAM). The firmware works on both without PSRAM —
+it only uses ~55 kB of RAM (internal memory is plenty).
 
-Wiring (do not change!):
+**CC1101 868 MHz** module.
+
+#### ESP32-S3 (DevKitC-1)
 
 | CC1101 | ESP32-S3 |
 |---|---|
@@ -188,22 +214,42 @@ Wiring (do not change!):
 | VCC   | 3.3 V  |
 | GND   | GND    |
 
+#### ESP32 WROOM-32 (DevKitC v4)
+
+> **Note:** on the classic ESP32, GPIO 6–11 are used by the internal flash,
+> so the wiring is DIFFERENT from the S3.
+
+| CC1101 | ESP32 WROOM | (S3 equivalent) |
+|---|---|---|
+| CSN   | GPIO5  | 10 → 5  |
+| SCK   | GPIO18 | 12 → 18 |
+| MISO/SO | GPIO19 | 13 → 19 |
+| MOSI/SI | GPIO23 | 11 → 23 |
+| GDO0  | GPIO4  | 5 → 4   |
+| GDO2  | GPIO16 | 6 → 16  |
+| VCC   | 3.3 V  | —       |
+| GND   | GND    | —       |
+
 SPI: 1 MHz, mode 0, VSPI bus. Keep the CC1101 antenna vertical, away from the ESP32
 (the ESP32 with WiFi produces noise) and away from metal. For longer power wires, add a 100 nF
 capacitor (and optionally 47–100 µF) close to the module's VCC–GND pins.
 
 ### Build & flash
 
-Requires [PlatformIO](https://platformio.org/) (project configured for `esp32-s3-devkitc-1`,
-Arduino framework).
+Requires [PlatformIO](https://platformio.org/) (Arduino framework).
 
 ```powershell
-# build
+# ESP32-S3 (default)
 pio run
-
-# flash (port COM12 — change in platformio.ini if needed)
 pio run -t upload
+
+# ESP32 WROOM-32 (4 MB, no PSRAM)
+pio run -e esp32-wroom
+pio run -e esp32-wroom -t upload
 ```
+
+Set the USB port in `platformio.ini` (`upload_port` / `monitor_port`) if the device
+gets a different port than `COM12`.
 
 ### Network configuration
 
