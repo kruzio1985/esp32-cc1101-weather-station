@@ -1839,9 +1839,13 @@ void handleRoot() {
     if (w.haveRain)
       html += "<tr><td>Opad (od włączenia)</td><td>" + String(w.rainMm, 1) + " mm</td></tr>";
     if (w.haveUv)
-      html += "<tr><td>UV / indeks UV</td><td>" + String(w.uv) + " / " + String(w.uvi) + "</td></tr>";
-    if (w.haveLight)
-      html += "<tr><td>Światło</td><td>" + String(w.lightLux, 0) + (w.model == "Vevor-YT60309" ? " W/m²" : " lux") + "</td></tr>";
+      html += "<tr><td>Indeks UV</td><td>" + String(w.uvi) + "</td></tr>";
+    if (w.haveLight) {
+      if (w.model == "Vevor-YT60309")
+        html += "<tr><td>Światło</td><td>" + String(w.lightLux, 0) + " W/m²</td></tr>";
+      else
+        html += "<tr><td>Światło</td><td>" + String(w.lightLux, 0) + " lux (" + String(w.lightLux / 1000.0f, 2) + " k lux)</td></tr>";
+    }
     html += "<tr><td>RSSI</td><td>" + String(w.rssi) + " dBm</td></tr>";
     html += "<tr><td>Ostatni pakiet</td><td class='hex'>" + lastDecodedHex + "</td></tr>";
     html += R"(</table>)";

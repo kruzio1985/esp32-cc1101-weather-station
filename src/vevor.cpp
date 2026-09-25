@@ -67,7 +67,11 @@ bool decodeVevor7in1(const uint8_t* b, int len, WeatherData& w) {
 
   int uv_index    = (b[15] & 0x1f) - 1;
 
-  int light_raw   = ((b[16] << 8) | b[17]) - 257;
+  // Światło: offset "1 na bajt" (jak w rtl_433) — od każdego bajtu odejmujemy 1,
+  // z zawinięciem uint8 (0x00 -> 0xff), potem bit15 = mnożnik ×10.
+  uint8_t b16 = (uint8_t)(b[16] - 1);
+  uint8_t b17 = (uint8_t)(b[17] - 1);
+  int light_raw   = (b16 << 8) | b17;
   int lux_multi   = (light_raw & 0x8000) >> 15;
   int light_lux   = light_raw & 0x7fff;
   if (lux_multi == 1) light_lux *= 10;
@@ -104,7 +108,7 @@ bool decodeVevor7in1(const uint8_t* b, int len, WeatherData& w) {
   }
   if (uv_index >= 0 && uv_index <= 16) {
     w.haveUv = true;
-    w.uv = uv_index * 100;   // przybliżona wartość surowa (nie mamy surowego UV)
+    w.uv = 0;                 // protokół 263 nie przesyła surowego UV — tylko indeks
     w.uvi = uv_index;
   }
   if (light_raw >= 0 && light_lux >= 0 && light_lux < 500000) {
