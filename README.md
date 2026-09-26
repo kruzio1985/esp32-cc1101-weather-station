@@ -64,7 +64,7 @@ flaga baterii oraz ID nadajnika (zależnie od tego, co dana stacja wysyła).
 ### WAŻNE — jakiego modułu radiowego użyć (nie klona!)
 
 Do tego odbiornika potrzebny jest **prawdziwy moduł CC1101** na **868 MHz**, najlepiej
-sprawdzony odpowiednik modułów **RadioControl** / **ELECHOUSE** (np. ten sam, co w projekcie
+sprawdzony odpowiednik modułów **RADIOCONTROLLI** / **ELECHOUSE** (np. ten sam, co w projekcie
 `WMBUS_RadioControl_866MHz`). Ten firmware był pisany i testowany na takim module.
 
 **Nie używaj tanich klonów.** Klony CC1101 (głównie z aukcji „CC1101 868MHz" bez marki) bardzo
@@ -86,20 +86,27 @@ module działa, a na klonie nie — mimo poprawnych połączeń SPI.
   pokazuje -70 dBm i więcej, moduł ma duży szum własny (typowe dla klonów) albo jest
   zagłuszany.
 
-#### Gdzie kupić porządny moduł (sprawdzone linki)
+#### Gdzie kupić **oryginalny** moduł
+
+Poniżej tylko **oryginały** (producent i duży dystrybutor). Celowo **nie ma tu linków do
+tanich klonów** z aukcji — właśnie one są najczęstszą przyczyną „radio nie odbiera".
 
 | Moduł | Sklep | Uwagi |
 |---|---|---|
-| **[RADIOCONTROLLI RC-CC1101-SPI-868 (THT)](https://www.tme.eu/pl/details/rc-cc1101-spi-868/moduly-rf/radiocontrolli/)** | **TME** | ⭐ polecany — profesjonalny moduł RadionControlli, 868 MHz, SPI, czułość -110 dBm, 1,8–3,6 V, 10 dBm, obudowa 21,5×15,6 mm, montaż przewlekany |
-| **[RADIOCONTROLLI RC-CC1101-SPI-SMT-868 (SMD)](https://www.tme.eu/pl/details/rc-cc1101-smt-868/moduly-rf/radiocontrolli/)** | **TME** | ta sama rodzina, wersja do montażu powierzchniowego 15×18 mm |
-| [Moduł radiowy CC1101 RF 868 MHz z anteną](https://sklep.msalamon.pl/produkt/modul-radiowy-cc1101-rf-868-mhz-z-antena/) | msalamon.pl | tani moduł typu „płytka z anteną" — działa, ale to typowy klon; sprawdź, czy odbiera (patrz diagnostyka wyżej) |
-| [Wyszukiwanie „CC1101 868 MHz"](https://allegro.pl/listing?string=cc1101%20868mhz) | Allegro | najtaniej, ale **największe ryzyko trafienia na klona** ze złym kwarcem |
+| **[RADIOCONTROLLI RC-CC1101-SPI-868 (THT)](https://www.tme.eu/pl/details/rc-cc1101-spi-868/moduly-rf/radiocontrolli/)** | **TME** | ⭐ polecany — oryginalny moduł RADIOCONTROLLI, **868 MHz**, SPI, czułość -110 dBm, 1,8–3,6 V, 10 dBm, 21,5×15,6 mm, montaż przewlekany |
+| **[RADIOCONTROLLI RC-CC1101-SPI-SMT-868 (SMD)](https://www.tme.eu/pl/details/rc-cc1101-smt-868/moduly-rf/radiocontrolli/rc-cc1101-spi-smt-868/)** | **TME** | ta sama rodzina, montaż powierzchniowy 15×18 mm |
+| **[RADIOCONTROLLI RC-CC1101-SPI-434 (THT)](https://www.tme.eu/pl/details/rc-cc1101-spi-434/moduly-rf/radiocontrolli/)** — pasmo **433 MHz** | **TME** | oryginał na 433 MHz (gdy odbiornik ma pracować na 433,92 MHz) |
+| **[Moduł CC1101 868 MHz — sklep producenta](https://shop.radiocontrolli.com/en/rf-modules-434868mhz/48-rc-cc1101-spi-868.html)** | RADIOCONTROLLI | bezpośrednio od producenta (Włochy) — oryginał |
+| **[Moduł CC1101 433 MHz — sklep producenta](https://shop.radiocontrolli.com/en/rf-modules-434868mhz/47-rc-cc1101-spi-434.html)** | RADIOCONTROLLI | bezpośrednio od producenta — wersja 433 MHz |
 
-**Zalecenie:** jeśli zależy Ci na pewnym odbiorze słabych ramek ze stacji oddalonej o
-kilkadziesiąt metrów, kup moduł z **TME (RadionControlli)** — jest droższy (~60 zł), ale ma
-poprawny kwarc 26 MHz, lepsze filtry i powtarzalne parametry. Tanie moduły z Allegro
-(~15 zł) często wymagają dołożenia kondensatora 100 nF + 10 µF przy VCC i mimo to bywają
-mniej czułe.
+**Zalecenie:** kup oryginalny moduł **RADIOCONTROLLI** (TME albo sklep producenta). Ma
+poprawny rezonator 26 MHz, ekranowanie i powtarzalne parametry — czyli dokładnie to, czego
+ten odbiornik potrzebuje do słabych ramek.
+
+Tanie klony (aukcje typu „CC1101 868 MHz z anteną", ~15 zł) potrafią działać, ale nie ma
+gwarancji, że mają rezonator 26 MHz — a bez niego **nie odbiorą 868 MHz**. Jeśli mimo to
+używasz takiego modułu, dołóż kondensator 100 nF + 10 µF przy VCC i sprawdź go diagnostyką
+opisaną wyżej.
 
 > Uwaga: nie każdy „CC1101 868 MHz" z aukcji ma wlutowany rezonator **26 MHz**. Zdarzają się
 > płytki z rezonatorem 27 MHz (od wersji 433 MHz) — taki moduł **nie odbierze 868 MHz**.
@@ -464,19 +471,28 @@ genuine module but not on the clone, despite correct SPI wiring.
 - the idle `RSSI` should be low (e.g. -100…-110 dBm). If it reads -70 dBm or higher with no
   transmission, the module has high self-noise (typical for clones) or is being jammed.
 
-#### Where to buy a good module (verified links)
+#### Where to buy a **genuine** module
+
+Only **originals** below (the manufacturer and a large distributor). There are deliberately
+**no links to cheap clones** from marketplace listings — those are the most common cause of
+"the radio does not receive anything".
 
 | Module | Shop | Notes |
 |---|---|---|
-| **[RADIOCONTROLLI RC-CC1101-SPI-868 (THT)](https://www.tme.eu/pl/details/rc-cc1101-spi-868/moduly-rf/radiocontrolli/)** | **TME** | ⭐ recommended — professional RADIOCONTROLLI module, 868 MHz, SPI, -110 dBm sensitivity, 1.8–3.6 V, 10 dBm, 21.5×15.6 mm, through-hole |
-| **[RADIOCONTROLLI RC-CC1101-SPI-SMT-868 (SMD)](https://www.tme.eu/pl/details/rc-cc1101-smt-868/moduly-rf/radiocontrolli/)** | **TME** | same family, surface-mount version 15×18 mm |
-| [CC1101 RF 868 MHz module with antenna](https://sklep.msalamon.pl/produkt/modul-radiowy-cc1101-rf-868-mhz-z-antena/) | msalamon.pl | cheap "board with antenna" type — it works, but it is a typical clone; verify reception (see diagnostics above) |
-| [Search "CC1101 868 MHz"](https://allegro.pl/listing?string=cc1101%20868mhz) | Allegro | cheapest, but **highest risk of a clone** with the wrong crystal |
+| **[RADIOCONTROLLI RC-CC1101-SPI-868 (THT)](https://www.tme.eu/pl/details/rc-cc1101-spi-868/moduly-rf/radiocontrolli/)** | **TME** | ⭐ recommended — genuine RADIOCONTROLLI module, **868 MHz**, SPI, -110 dBm sensitivity, 1.8–3.6 V, 10 dBm, 21.5×15.6 mm, through-hole |
+| **[RADIOCONTROLLI RC-CC1101-SPI-SMT-868 (SMD)](https://www.tme.eu/pl/details/rc-cc1101-smt-868/moduly-rf/radiocontrolli/rc-cc1101-spi-smt-868/)** | **TME** | same family, surface-mount version 15×18 mm |
+| **[RADIOCONTROLLI RC-CC1101-SPI-434 (THT)](https://www.tme.eu/pl/details/rc-cc1101-spi-434/moduly-rf/radiocontrolli/)** — **433 MHz** band | **TME** | genuine 433 MHz part (if the receiver is to work on 433.92 MHz) |
+| **[CC1101 868 MHz module — manufacturer shop](https://shop.radiocontrolli.com/en/rf-modules-434868mhz/48-rc-cc1101-spi-868.html)** | RADIOCONTROLLI | straight from the manufacturer (Italy) — genuine |
+| **[CC1101 433 MHz module — manufacturer shop](https://shop.radiocontrolli.com/en/rf-modules-434868mhz/47-rc-cc1101-spi-434.html)** | RADIOCONTROLLI | straight from the manufacturer — 433 MHz version |
 
-**Recommendation:** if you need reliable reception of weak frames from a station tens of metres
-away, buy the **TME (RADIOCONTROLLI)** module — it costs more (~60 PLN) but has a correct 26 MHz
-crystal, better filters and repeatable parameters. Cheap ~15 PLN boards often need an extra
-100 nF + 10 µF capacitor at VCC and are still less sensitive.
+**Recommendation:** buy the genuine **RADIOCONTROLLI** module (TME or the manufacturer shop).
+It has the correct 26 MHz resonator, shielding and repeatable parameters — exactly what this
+receiver needs for weak frames.
+
+Cheap clones ("CC1101 868 MHz with antenna" listings, ~15 PLN) can work, but there is no
+guarantee they carry a 26 MHz resonator — and without it they **will not receive 868 MHz**.
+If you use one anyway, add a 100 nF + 10 µF capacitor at VCC and verify it with the
+diagnostics described above.
 
 > Note: not every "CC1101 868 MHz" auction listing has a **26 MHz** resonator fitted. Boards
 > with a 27 MHz resonator (from the 433 MHz version) exist — such a module **will not receive
