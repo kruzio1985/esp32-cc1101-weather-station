@@ -204,6 +204,24 @@ Jeśli automat wybierze zły port, podaj go ręcznie:
 pio run -e esp32-wroom -t upload --upload-port COM5
 ```
 
+#### Prościej: gotowy skrypt `build.cmd`
+
+W katalogu projektu jest skrypt, który **sam powtarza build**, gdy PlatformIO przerwie go
+przejściowym błędem pakietu (zamiast tego trzeba wtedy pamiętać o `pio pkg install`):
+
+```powershell
+build                          # build esp32-wroom
+build -Env esp32s3             # build ESP32-S3
+build -Env all                 # oba warianty
+build -Upload                  # build + wgranie po USB
+build -Upload -Port COM8       # ... ze wskazaniem portu
+build -Clean                   # czyszczenie przed buildem
+```
+
+`build.cmd` uruchamia `build.ps1` z `-ExecutionPolicy Bypass`, więc działa nawet gdy
+PowerShell blokuje skrypty. Skrypt pokazuje zajętość Flash/RAM, a przy błędzie wgrywania
+podpowiada procedurę BOOT + EN/RST (albo że port jest zajęty).
+
 #### Ważne: wymagany rdzeń Arduino 3.x
 
 Firmware używa API, które istnieje dopiero w **Arduino-ESP32 core 3.x**. Oficjalna
@@ -539,6 +557,24 @@ port, pass it explicitly:
 ```powershell
 pio run -e esp32-wroom -t upload --upload-port COM5
 ```
+
+#### Simpler: the included `build.cmd` script
+
+The project ships a script that **retries the build automatically** when PlatformIO aborts
+with a transient package error (otherwise you have to remember to run `pio pkg install`):
+
+```powershell
+build                          # build esp32-wroom
+build -Env esp32s3             # build ESP32-S3
+build -Env all                 # both variants
+build -Upload                  # build + flash over USB
+build -Upload -Port COM8       # ... specifying the port
+build -Clean                   # clean before building
+```
+
+`build.cmd` invokes `build.ps1` with `-ExecutionPolicy Bypass`, so it works even when
+PowerShell blocks scripts. The script prints Flash/RAM usage, and on a failed upload it
+suggests the BOOT + EN/RST procedure (or tells you the port is busy).
 
 #### Important: Arduino core 3.x is required
 
