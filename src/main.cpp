@@ -77,7 +77,7 @@ FilterCfg filterCfg;
 //                  (do rozpracowywania nieznanych protokołów).
 //  FINE_OFFSET   - nasłuch na 868.30 MHz / 2-FSK 17.24k / sync 0x2DD4
 //                  i dekodowanie stacji Fine Offset WH65 (VEVOR YT60309).
-//  VEVOR_7IN1    - nasłuch na 868.35 MHz / 2-FSK 11.11k / sync 0xCA54
+//  VEVOR_7IN1    - nasłuch na 868.30 MHz / 2-FSK 11.11k / sync 0xCA54
 //                  i dekodowanie stacji VEVOR/Youtong 7-in-1 (YT60231/234).
 //  VEVOR_YT60309 - nasłuch na 868.35 MHz / 2-FSK 11.11k / sync 0xC0AA C0AA
 //                  i dekodowanie stacji VEVOR YT60309 (CMT2119A, 32 bajty).

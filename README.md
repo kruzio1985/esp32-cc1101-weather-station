@@ -1,13 +1,15 @@
-# ESP32-S3 + CC1101 — Odbiornik stacji pogodowej 868 MHz
-# ESP32-S3 + CC1101 — 868 MHz Weather Station Receiver
+# ESP32 (WROOM-32 / S3) + CC1101 — Odbiornik stacji pogodowej 868 MHz
+# ESP32 (WROOM-32 / S3) + CC1101 — 868 MHz Weather Station Receiver
 
 [Polski](#polski) · [English](#english)
 
-Firmware dla **ESP32-S3** z modułem radiowym **CC1101** (868 MHz). Odbiera i dekoduje
+Firmware dla **ESP32** — klasyczny **WROOM-32** albo **ESP32-S3** — z modułem radiowym
+**CC1101** (868 MHz). Odbiera i dekoduje
 bezprzewodowe stacje pogodowe (głównie **VEVOR / Youtong 7-w-1, protokół 263**) i udostępnia
 dane przez stronę WWW, JSON, HTTP oraz MQTT.
 
-Firmware for an **ESP32-S3** with a **CC1101** (868 MHz) radio module. It receives and decodes
+Firmware for an **ESP32** (classic **WROOM-32** or **ESP32-S3**) with a **CC1101** (868 MHz)
+radio module. It receives and decodes
 wireless weather stations (mainly **VEVOR / Youtong 7-in-1, protocol 263**) and exposes the data
 via a web page, JSON, HTTP and MQTT.
 
