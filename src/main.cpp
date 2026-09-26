@@ -307,14 +307,23 @@ String T(const String& pl, const String& en) {
 }
 
 // Zwraca tekst "polski" z markera «polski|english» (albo tekst bez zmian).
-// Używane do portu szeregowego i pliku błędów, żeby tam nie trafiały markery.
+// Używane do portu szeregowego, pliku błędów i JSON, żeby nie trafiały tam markery.
+// UWAGA: « i » to w UTF-8 po 2 bajty, więc trzeba je pominąć w całości
+// (pominięcie 1 bajtu zostawiało połówkę znaku i "krzaki" w terminalu).
 String stripLang(const String& s) {
-  int a = s.indexOf("«");
-  if (a < 0) return s;
-  int b = s.indexOf("|", a);
-  int c = s.indexOf("»", a);
-  if (b < 0 || c < 0 || b > c) return s;
-  return s.substring(0, a) + s.substring(a + 1, b) + s.substring(c + 1);
+  String out = s;
+  int guard = 0;
+  while (guard++ < 8) {
+    int a = out.indexOf("\xC2\xAB");          // «
+    if (a < 0) break;
+    int b = out.indexOf("|", a + 2);
+    int c = out.indexOf("\xC2\xBB", a + 2);  // »
+    if (b < 0) break;
+    // Gdy brak zamykajacego » (np. komunikat uciety), po prostu odetnij reszte.
+    if (c < 0 || b > c) { out = out.substring(0, a) + out.substring(a + 2, b); break; }
+    out = out.substring(0, a) + out.substring(a + 2, b) + out.substring(c + 2);
+  }
+  return out;
 }
 
 // Pasek wyboru języka (flagi).
@@ -363,7 +372,7 @@ enum LogLevel { LOG_INFO = 0, LOG_WARN = 1, LOG_ERROR = 2 };
 struct LogEntry {
   unsigned long t;      // ms od startu
   uint8_t level;
-  char msg[72];
+  char msg[128];        // bufor na komunikat (markery «PL|EN» mieszcza sie w calosci)
 };
 const int MAX_LOG = 40;
 LogEntry eventLog[MAX_LOG];
@@ -4152,7 +4161,7 @@ String buildDiagReport() {
   s.reserve(2600);
   s += "==================== STAN URZADZENIA / DEVICE STATUS ====================\n";
   s += "Uptime (czas pracy)          : " + String((millis() - startTime) / 1000) + " s\n";
-  s += "Powod restartu / Reset reason: " + String(resetReasonText(bootResetReason)) + "\n";
+  s += "Powod restartu / Reset reason: " + stripLang(String(resetReasonText(bootResetReason))) + "\n";
   s += "Liczba startow / Boot count  : " + String(rtcBootCount) + "\n";
   s += "Restarty watchdog / WDT reset: " + String(rtcWdtResets) + "\n";
   s += "Brownout (zasilanie)         : " + String(rtcBrownouts) + "\n";
@@ -4316,7 +4325,7 @@ void handleErrorsPage() {
 void handleStatus() {
   String j = "{";
   j += "\"uptime\":" + String((millis() - startTime) / 1000) + ",";
-  j += "\"resetReason\":\"" + String(resetReasonText(bootResetReason)) + "\",";
+  j += "\"resetReason\":\"" + stripLang(String(resetReasonText(bootResetReason))) + "\",";
   j += "\"bootCount\":" + String(rtcBootCount) + ",";
   j += "\"wdtResets\":" + String(rtcWdtResets) + ",";
   j += "\"brownouts\":" + String(rtcBrownouts) + ",";
