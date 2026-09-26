@@ -83,12 +83,21 @@ Moduł **CC1101 868 MHz**.
 
 #### ESP32 WROOM-32 (DevKitC v4)
 
-> **Uwaga:** na klasycznym ESP32 piny GPIO 6–11 są zajęte przez wewnętrzny flash,
+> **Uwaga 1:** na klasycznym ESP32 piny GPIO 6–11 są zajęte przez wewnętrzny flash,
 > więc podłączenie jest INNE niż na S3.
+>
+> **Uwaga 2 (ważne):** CSN **musi** być na GPIO27, a **nie** na GPIO5.
+> Na klasycznym ESP32 GPIO5 to sprzętowy **CS0 kontrolera VSPI** — tego samego,
+> którego używamy (GPIO18/19/23 to piny IOMUX VSPI). Sprzętowy CS0 przejmuje
+> wtedy linię i przełącza ją między bajtami transakcji. Objaw jest bardzo
+> mylący: odczyty rejestrów CC1101 działają, a **zapisy nigdy nie docierają**
+> (rejestry zostają na wartościach fabrycznych, radio siedzi na 800 MHz i nie
+> wchodzi w RX). Na S3 ten problem nie występuje, bo używany tam GPIO10 nie
+> jest CS0 tej magistrali.
 
 | CC1101 | ESP32 WROOM | (odpowiednik S3) |
 |---|---|---|
-| CSN   | GPIO5  | 10 → 5  |
+| CSN   | GPIO27 | 10 → 27 |
 | SCK   | GPIO18 | 12 → 18 |
 | MISO/SO | GPIO19 | 13 → 19 |
 | MOSI/SI | GPIO23 | 11 → 23 |
@@ -97,7 +106,10 @@ Moduł **CC1101 868 MHz**.
 | VCC   | 3.3 V  | —       |
 | GND   | GND    | —       |
 
-SPI: 1 MHz, tryb 0, magistrala VSPI. Antena CC1101 powinna być ustawiona pionowo,
+SPI: prędkość dobierana automatycznie (100 kHz…4 MHz), tryb 0, magistrala VSPI.
+Firmware sam sprawdza zapis/odczyt i wybiera najszybszą działającą prędkość,
+a test powtarza co 30 s — dzięki temu działa też na dłuższych kablach.
+Antena CC1101 powinna być ustawiona pionowo,
 z dala od ESP32 (ESP32 z WiFi generuje szumy) i z dala od metalowych elementów.
 Przy dłuższych przewodach zasilających dodaj kondensator 100 nF (i opcjonalnie 47–100 µF)
 tuż przy pinach VCC–GND modułu.
@@ -119,6 +131,16 @@ pio run -e esp32-wroom -t upload
 Port USB ustaw w `platformio.ini` (`upload_port` / `monitor_port`), jeśli urządzenie
 dostaje inny port niż `COM12`.
 
+> **Wgrywanie na płytkę WROOM:** ta płytka często nie robi autoresetu niezawodnie.
+> Jeśli `pio run -e esp32-wroom -t upload` zgłasza `Wrong boot mode detected`,
+> wymuś tryb download ręcznie: **przytrzymaj BOOT**, naciśnij i puść **EN/RST**,
+> nadal trzymaj BOOT aż wgrywanie ruszy (`Wrote ... bytes`). W `platformio.ini`
+> dla tego środowiska ustawione jest `upload_flags = --before no-reset` — dzięki
+> temu esptool nie „walczy" z przyciskiem.
+>
+> Jeśli płytka zgłasza `Invalid head of packet` — to zakłócenie synchronizacji;
+> po prostu powtórz wgrywanie.
+
 ### Konfiguracja sieci
 
 - **AP (punkt dostępowy)**: SSID `WeatherSniffer`, hasło `sniffer123`, adres `192.168.4.1`.
@@ -126,6 +148,28 @@ dostaje inny port niż `COM12`.
 - **STA (Twoje WiFi)**: konfiguruje się przez panel WWW (zakładka ustawień). Dane są zapisywane
   w pamięci NVS urządzenia — **nie wpisuj ich w kodzie źródłowym** (ten plik może trafić na
   publiczne repozytorium).
+
+> **Uwaga:** wgranie scalonego obrazu `firmware.factory.bin` od adresu `0x0`
+> (np. `esptool write-flash 0x0 firmware.factory.bin`) **kasuje NVS** — tracisz
+> zapisane WiFi, tryb pracy i kalibrację. Normalne `pio run -t upload` wgrywa
+> tylko aplikację i NVS zostaje. Po takim wgraniu urządzenie startuje w trybie AP
+> i trzeba WiFi skonfigurować ponownie.
+
+### Diagnostyka radia
+
+Firmware sam sprawdza tor SPI i wypisuje wynik na porcie szeregowym (115200):
+
+- `SPI autotune: 4000k=A5 ... -> OK, wybrano X kHz` — zapis do CC1101 dociera,
+  wybrano najszybszą działającą prędkość SPI. `A5` to wartość, którą zapisano
+  i odczytano z powrotem.
+- `CC1101 VERSION=0x14 PARTNUM=0x0` — układ odpowiada prawidłowo.
+- `CC1101: RX aktywny (MARCSTATE=0x0D)` — radio weszło w odbiór.
+- `-> BLAD: zapis do CC1101 nie dociera...` — sygnał problemu z okablowaniem.
+  Na płytce WROOM najczęstsza przyczyna to **CSN na GPIO5** (patrz tabela
+  podłączenia wyżej).
+
+Test powtarzany jest co 30 s, więc jeśli połączenie się pogorszy, firmware sam
+przejdzie na wolniejszą prędkość SPI.
 
 ### Kalibracja
 
@@ -216,12 +260,21 @@ it only uses ~55 kB of RAM (internal memory is plenty).
 
 #### ESP32 WROOM-32 (DevKitC v4)
 
-> **Note:** on the classic ESP32, GPIO 6–11 are used by the internal flash,
+> **Note 1:** on the classic ESP32, GPIO 6–11 are used by the internal flash,
 > so the wiring is DIFFERENT from the S3.
+>
+> **Note 2 (important):** CSN **must** be on GPIO27, **not** on GPIO5.
+> On the classic ESP32 GPIO5 is the hardware **CS0 of the VSPI controller** —
+> the very controller used here (GPIO18/19/23 are the VSPI IOMUX pins). The
+> hardware CS0 then takes over the line and toggles it between the bytes of a
+> transaction. The symptom is very misleading: CC1101 register *reads* work
+> while *writes* never arrive (registers stay at factory defaults, the radio
+> stays on 800 MHz and never enters RX). This does not happen on the S3 because
+> the GPIO10 used there is not the CS0 of that bus.
 
 | CC1101 | ESP32 WROOM | (S3 equivalent) |
 |---|---|---|
-| CSN   | GPIO5  | 10 → 5  |
+| CSN   | GPIO27 | 10 → 27 |
 | SCK   | GPIO18 | 12 → 18 |
 | MISO/SO | GPIO19 | 13 → 19 |
 | MOSI/SI | GPIO23 | 11 → 23 |
@@ -230,7 +283,10 @@ it only uses ~55 kB of RAM (internal memory is plenty).
 | VCC   | 3.3 V  | —       |
 | GND   | GND    | —       |
 
-SPI: 1 MHz, mode 0, VSPI bus. Keep the CC1101 antenna vertical, away from the ESP32
+SPI: speed selected automatically (100 kHz…4 MHz), mode 0, VSPI bus.
+The firmware verifies a write/read-back and picks the fastest working speed,
+re-testing every 30 s — so it also works on longer wires.
+Keep the CC1101 antenna vertical, away from the ESP32
 (the ESP32 with WiFi produces noise) and away from metal. For longer power wires, add a 100 nF
 capacitor (and optionally 47–100 µF) close to the module's VCC–GND pins.
 
@@ -251,6 +307,15 @@ pio run -e esp32-wroom -t upload
 Set the USB port in `platformio.ini` (`upload_port` / `monitor_port`) if the device
 gets a different port than `COM12`.
 
+> **Flashing the WROOM board:** auto-reset is often unreliable on this board. If
+> `pio run -e esp32-wroom -t upload` reports `Wrong boot mode detected`, enter
+> download mode manually: **hold BOOT**, press and release **EN/RST**, keep
+> holding BOOT until flashing starts (`Wrote ... bytes`). `platformio.ini` sets
+> `upload_flags = --before no-reset` for this environment so that esptool does
+> not fight the button.
+>
+> An `Invalid head of packet` error is a sync glitch — just retry the upload.
+
 ### Network configuration
 
 - **AP (access point)**: SSID `WeatherSniffer`, password `sniffer123`, address `192.168.4.1`.
@@ -258,6 +323,28 @@ gets a different port than `COM12`.
 - **STA (your WiFi)**: configured via the web panel (settings tab). Credentials are stored in the
   device's NVS memory — **do not put them in the source code** (this file may end up in a public
   repository).
+
+> **Note:** flashing a merged `firmware.factory.bin` from address `0x0`
+> (e.g. `esptool write-flash 0x0 firmware.factory.bin`) **erases NVS** — you lose
+> the saved WiFi, operating mode and calibration. A normal `pio run -t upload`
+> writes only the application, so NVS survives. After such a flash the device
+> boots in AP mode and WiFi must be configured again.
+
+### Radio diagnostics
+
+The firmware validates the SPI path by itself and prints the result on the serial
+port (115200):
+
+- `SPI autotune: 4000k=A5 ... -> OK, wybrano X kHz` — writes reach the CC1101 and
+  the fastest working SPI speed was selected. `A5` is the value written to a
+  register and read back.
+- `CC1101 VERSION=0x14 PARTNUM=0x0` — the chip responds correctly.
+- `CC1101: RX aktywny (MARCSTATE=0x0D)` — the radio entered RX.
+- `-> BLAD: zapis do CC1101 nie dociera...` — a wiring problem. On the WROOM board
+  the most common cause is **CSN on GPIO5** (see the wiring table above).
+
+The test repeats every 30 s, so if the connection degrades the firmware
+automatically falls back to a slower SPI speed.
 
 ### Calibration
 

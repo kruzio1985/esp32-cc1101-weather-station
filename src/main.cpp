@@ -146,12 +146,17 @@ void publishWeather();
 // więc piny muszą być inne niż na ESP32-S3 (patrz README).
 #ifdef BOARD_WROOM
   // ESP32 (WROOM / DevKitC v4) — magistrala VSPI
-  #define PIN_CS   5
+  #define PIN_CS   27
   #define PIN_SCK  18
   #define PIN_MISO 19
   #define PIN_MOSI 23
   #define PIN_GDO0 4
   #define PIN_GDO2 16
+  // UWAGA: CS NIE MOZE byc na GPIO5! Na klasycznym ESP32 GPIO5 to sprzetowy
+  // CS0 kontrolera VSPI - tego samego, ktorego uzywamy (SCK=18, MISO=19,
+  // MOSI=23 to piny IOMUX wlasnie VSPI). Sprzetowy CS0 przejmuje wtedy linie
+  // i przelacza ja miedzy bajtami transakcji: odczyty przypadkiem dzialaja,
+  // a ZAPISY nigdy nie docieraja (rejestry zostaja na wartosciach fabrycznych).
 #else
   // ESP32-S3 (DevKitC-1)
   #define PIN_CS   10
@@ -286,24 +291,62 @@ unsigned long startTime = 0;
 int comboHits[6][8];  // licznik trafień per (freq, prof)
 
 // ==================== CC1101 FUNKCJE ====================
-// Prędkość SPI dobrana pod ten moduł (oryginalny firmware RadioControl
-// używał domyślnego, wolnego SPI ~1 MHz; 4 MHz powodowało niestabilne odczyty).
-#define SPI_HZ 1000000
+// Prędkość SPI. NIE jest stała - ustala ją automatycznie ccSpiAutotune().
+// Dlaczego: na dłuższych kablach (typowe 10 cm) naruszenie czasu setup/hold
+// na linii MOSI potrafi psuć ZAPISY do CC1101, podczas gdy ODCZYTY nadal
+// działają. Objaw: rejestry zostają na wartościach fabrycznych (radio na
+// 800 MHz), a odczyty VERSION/LQI/RSSI wyglądają poprawnie.
+uint32_t gSpiHz = 1000000;
+
+// Komendy strobowania CC1101 (datasheet, rozdz. 11.3 / naglowki biblioteki
+// ELECHOUSE CC1101). UWAGA: latwo je pomylic!
+//   0x39 = SPWD  -> POWER DOWN (gasi kwarc!) - NIE uzywac przy odbiorze
+//   0x3A = SFRX  -> flush RX FIFO  (to jest "SFRX")
+//   0x3B = SFTX  -> flush TX FIFO
+#define CC_SIDLE 0x36
+#define CC_SPWD  0x39
+#define CC_SFRX  0x3A
+#define CC_SFTX  0x3B
+#define CC_SRX   0x34
+#define CC_SRES  0x30
+#define CC_SCAL  0x33
+
+// Gdy true, ccStartRx/ccDumpRegs wypisuja szczegoly do portu szeregowego.
+bool gRadioVerbose = true;
 
 inline void csLow()  { digitalWrite(PIN_CS, LOW); }
 inline void csHigh() { digitalWrite(PIN_CS, HIGH); }
 
-uint8_t ccXfer(uint8_t b) {
-  return radioSPI.transfer(b);
+// UWAGA (ważne dla stabilności na klasycznym ESP32):
+// CS musi być opuszczany WEWNĄTRZ transakcji SPI, tzn. po beginTransaction()
+// i podniesiony PRZED endTransaction(). Jeśli CS jest opuszczany poza
+// transakcją, procesor może zostać wywłaszczony (WiFi) w oknie, gdy CS jest
+// już nisko, a SPI jeszcze nie jest zablokowane - dochodzi wtedy do nakładania
+// się transakcji i CC1101 zaczyna zwracać śmieci.
+// Dodatkowo przed podniesieniem CS dajemy chwilę, aby CC1101 zarejestrował
+// ostatni zbocze zegara.
+#define CC_CS_SETTLE_US 2
+
+// Jeden dostep SPI do CC1101: CS nisko, wszystkie bajty, CS wysoko.
+// CELOWO pojedyncze transfer() na kazdy bajt (jak w dzialajacym firmware
+// referencyjnym) - ta wersja udowodnila poprawne odczyty (VERSION=0x14,
+// PARTNUM=0x00, caly zrzut rejestrow rowny wartosciom fabrycznym).
+// transferBytes() dla 2 bajtow pakuje dane w jedno slowo 16-bitowe wysylane
+// MSB-first, co zamienia kolejnosc bajtow i psuje dostep do ukladu.
+void ccTransfer(const uint8_t* tx, uint8_t* rx, size_t n, uint32_t hz = gSpiHz) {
+  if (n == 0) return;
+  radioSPI.beginTransaction(SPISettings(hz, MSBFIRST, SPI_MODE0));
+  csLow();
+  for (size_t i = 0; i < n; i++) rx[i] = radioSPI.transfer(tx[i]);
+  delayMicroseconds(CC_CS_SETTLE_US);
+  csHigh();
+  radioSPI.endTransaction();
 }
 
 void ccWrite(uint8_t reg, uint8_t value) {
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(reg);
-  ccXfer(value);
-  radioSPI.endTransaction();
-  csHigh();
+  uint8_t tx[2] = { reg, value };
+  uint8_t rx[2];
+  ccTransfer(tx, rx, 2);
 }
 
 // Nadpisanie częstotliwości dla trybu AUTO (przemiatanie pasma 868 MHz).
@@ -318,31 +361,161 @@ void ccWriteFreq(uint8_t d, uint8_t e, uint8_t f) {
 }
 
 uint8_t ccRead(uint8_t reg) {
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(reg | 0x80);
-  uint8_t v = ccXfer(0);
-  radioSPI.endTransaction();
-  csHigh();
-  return v;
+  uint8_t tx[2] = { (uint8_t)(reg | 0x80), 0x00 };
+  uint8_t rx[2];
+  ccTransfer(tx, rx, 2);
+  return rx[1];
 }
 
 uint8_t ccStatusRead(uint8_t reg) {
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(reg | 0xC0);   // rejestry statusu: odczyt z bitem burst
-  uint8_t v = ccXfer(0);
-  radioSPI.endTransaction();
-  csHigh();
-  return v;
+  uint8_t tx[2] = { (uint8_t)(reg | 0xC0), 0x00 };  // status: odczyt z bitem burst
+  uint8_t rx[2];
+  ccTransfer(tx, rx, 2);
+  return rx[1];
+}
+
+// Odczyt n bajtów z bufora odbioru CC1101 (RX FIFO, rejestr 0x3F).
+// UWAGA: CELOWO nie używamy odczytu burst (bajt 0xFF). Taki odczyt trzyma CS
+// nisko przez cały transfer (~650 us przy 64 bajtach) i na klasycznym ESP32
+// TRWALE blokuje CC1101 - potwierdzone testem: po 5 odczytach burst radio
+// przestaje odpowiadać po SPI (VERSION zwraca śmieci). Działający firmware
+// referencyjny czyta FIFO pojedynczymi odczytami (CS nisko tylko ~20 us).
+int ccReadFifo(uint8_t* buf, int n) {
+  for (int i = 0; i < n; i++) buf[i] = ccRead(0x3F);
+  return n;
 }
 
 void ccStrobe(uint8_t cmd) {
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(cmd);
-  radioSPI.endTransaction();
-  csHigh();
+  uint8_t tx[1] = { cmd };
+  uint8_t rx[1];
+  ccTransfer(tx, rx, 1);
+}
+
+// Powrót do odbioru (RX).
+// UWAGA: CC1101 potrzebuje chwili na obsłużenie każdego stroba, a CIĄGŁE
+// strobowanie SRX potrafi go TRWALE zablokować (przestaje odpowiadać po SPI).
+// Dlatego: odstępy między strobani + wywoływać TYLKO wtedy, gdy naprawdę trzeba.
+// Zwraca true, jesli uklad potwierdzil wejscie w RX (MARCSTATE=0x0D).
+bool ccStartRx() {
+  ccStrobe(CC_SIDLE);
+  delay(1);
+  ccStrobe(CC_SFRX);   // 0x3A - wyczysc bufor odbioru (NIE 0x39 = SPWD!)
+  delay(1);
+  ccStrobe(CC_SRX);
+  delay(3);
+  // IDLE->RX wymaga zablokowania PLL, to trwa.
+  uint32_t seen = 0;
+  for (int i = 0; i < 150; i++) {
+    uint8_t ms = ccStatusRead(0x35) & 0x1F;
+    if (ms == 0x0D) return true;
+    seen |= (1UL << ms);
+    delayMicroseconds(100);
+  }
+  if (gRadioVerbose) {
+    Serial.print("CC1101: MARCSTATE po SRX =");
+    for (int i = 0; i < 32; i++) {
+      if (seen & (1UL << i)) {
+        Serial.print(" 0x");
+        if (i < 16) Serial.print("0");
+        Serial.print(i, HEX);
+      }
+    }
+    Serial.println();
+  }
+  return false;
+}
+
+// AUTOMATYCZNY DOBÓR PRĘDKOŚCI SPI.
+// Test: zapisz wzorzec 0xA5 do rejestru SYNC1 (0x04, nieużywany w tym trybie)
+// i odczytaj go z powrotem. Jeśli zapis faktycznie dotarł, odczyt = 0xA5.
+// Wybierana jest NAJSZYBSZA prędkość, przy której to działa.
+// Dzięki temu firmware sam radzi sobie z długimi kablami / słabym kontaktem,
+// gdzie zapisy przestają docierać, a odczyty jeszcze działają.
+bool ccSpiAutotune() {
+  static const uint32_t cand[] = { 4000000, 2000000, 1000000, 500000, 250000, 100000 };
+  const unsigned NC = sizeof(cand) / sizeof(cand[0]);
+  const uint8_t R = 0x04;   // SYNC1
+  uint8_t got[6], orig[6];
+  uint32_t chosen = 0;
+
+  for (unsigned i = 0; i < NC; i++) {
+    uint32_t hz = cand[i];
+
+    uint8_t rd[2] = { (uint8_t)(R | 0x80), 0x00 };
+    uint8_t rv[2];
+    ccTransfer(rd, rv, 2, hz);
+    orig[i] = rv[1];
+
+    uint8_t wx[2] = { R, 0xA5 };
+    uint8_t wr[2];
+    ccTransfer(wx, wr, 2, hz);
+
+    uint8_t rd2[2] = { (uint8_t)(R | 0x80), 0x00 };
+    uint8_t rv2[2];
+    ccTransfer(rd2, rv2, 2, hz);
+    got[i] = rv2[1];
+
+    if (got[i] == 0xA5 && chosen == 0) chosen = hz;
+
+    uint8_t rb[2] = { R, orig[i] };   // przywróć poprzednią wartość
+    uint8_t jn[2];
+    ccTransfer(rb, jn, 2, hz);
+  }
+
+  Serial.print("SPI autotune:");
+  for (unsigned i = 0; i < NC; i++) {
+    Serial.print(" ");
+    Serial.print(cand[i] / 1000);
+    Serial.print("k=");
+    Serial.print(got[i], HEX);
+  }
+  if (chosen) {
+    gSpiHz = chosen;
+    Serial.print("  -> OK, wybrano ");
+    Serial.print(chosen / 1000);
+    Serial.println(" kHz");
+    return true;
+  }
+  gSpiHz = 100000;
+  Serial.println("  -> BLAD: zapis do CC1101 nie dociera przy zadnej predkosci!");
+  return false;
+}
+
+// Wypisuje kluczowe rejestry konfiguracyjne - pozwala sprawdzic, czy zapisy
+// faktycznie dotarly do ukladu (odczyt == zapis).
+void ccDumpRegs() {
+  static const uint8_t regs[] = {0x00, 0x02, 0x06, 0x07, 0x08, 0x0D, 0x0E, 0x0F,
+                                 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x18, 0x19,
+                                 0x1A, 0x1B, 0x1C, 0x1D, 0x21, 0x22};
+  Serial.print("CC1101 regs:");
+  for (unsigned k = 0; k < sizeof(regs); k++) {
+    uint8_t r = regs[k];
+    uint8_t v = ccRead(r);
+    Serial.print(" ");
+    if (r < 0x10) Serial.print("0");
+    Serial.print(r, HEX);
+    Serial.print("=");
+    if (v < 0x10) Serial.print("0");
+    Serial.print(v, HEX);
+  }
+  Serial.println();
+}
+
+// Test kwarcu (XOSC). SCAL wymusza kalibracje czestotliwosci: przy pracujacym
+// kwarcu MARCSTATE przechodzi przez FS_CAL1 (0x06) / FS_CAL2 (0x07).
+// Jesli uklad zostaje w IDLE (0x01), kwarc nie wystartowal.
+bool ccCrystalAlive() {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    ccStrobe(CC_SIDLE);
+    delay(2);
+    ccStrobe(CC_SCAL);
+    for (int i = 0; i < 100; i++) {
+      uint8_t ms = ccStatusRead(0x35) & 0x1F;
+      if (ms == 0x06 || ms == 0x07) return true;   // FS_CAL1 / FS_CAL2
+      delayMicroseconds(100);
+    }
+  }
+  return false;
 }
 
 void ccReset() {
@@ -353,11 +526,9 @@ void ccReset() {
   csHigh();
   delayMicroseconds(45);
 
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(0x30); // SRES
-  radioSPI.endTransaction();
-  csHigh();
+  uint8_t tx[1] = { 0x30 };  // SRES
+  uint8_t rx[1];
+  ccTransfer(tx, rx, 1);
   delay(10);
 }
 
@@ -371,6 +542,10 @@ void ccInitBase() {
 
   // Pętle kalibracyjne / AGC / front-end - wartości z działającego firmware
   // RadioControl dla tego konkretnego modułu (CC1101 + ESP32-S3).
+  // MCSM0: FS_AUTOCAL = kalibracja przy przejściu IDLE->RX/TX,
+  // PO_TIMEOUT = maksymalny czas stabilizacji kwarcu (~1 ms) i
+  // XOSC_FORCE_ON = kwarc pracuje na stałe (pomaga, gdy kwarc modułu
+  // ma trudności ze startem - bez tego CC1101 zostaje w IDLE i nie odbiera).
   ccWrite(0x18, 0x18);  // MCSM0
   ccWrite(0x19, 0x17);  // FOCCFG
   ccWrite(0x1A, 0x6C);  // BSCFG
@@ -397,7 +572,7 @@ void ccInitBase() {
 // ==================== USTAWIENIE KOMBINACJI (freq + profil) ====================
 void applyCombo(int f, int p) {
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX (flush RX)
+  ccStrobe(CC_SFRX);  // SFRX (flush RX)
 
   ccWrite(0x0D, FREQ_TABLE[f][0]);  // FREQ2
   ccWrite(0x0E, FREQ_TABLE[f][1]);  // FREQ1
@@ -413,7 +588,7 @@ void applyCombo(int f, int p) {
 
   delay(3);
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
   ccStrobe(0x34);  // SRX
 }
 
@@ -422,7 +597,7 @@ void applyCombo(int f, int p) {
 // stała długość pakietu 17 bajtów (payload po sync).
 void applyFineOffsetMode() {
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
 
   ccWriteFreq(0x21, 0x65, 0x6A);  // 868.30 MHz (domyślnie)
   ccWrite(0x10, 0xB9);  // MDMCFG4: rate 17.26k, BW 116 kHz
@@ -440,7 +615,7 @@ void applyFineOffsetMode() {
 
   delay(3);
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
   ccStrobe(0x34);  // SRX
 }
 
@@ -451,7 +626,7 @@ void applyFineOffsetMode() {
 // snifferem).
 void applyVevorMode() {
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
 
   ccWriteFreq(0x21, 0x65, 0x6A);  // 868.30 MHz (Twoja stacja)
 
@@ -466,9 +641,16 @@ void applyVevorMode() {
   ccWrite(0x08, 0x02);  // PKTCTRL0: nieskonczona dlugosc
 
   delay(3);
-  ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
-  ccStrobe(0x34);  // SRX
+  if (ccStartRx()) {
+    Serial.println("CC1101: RX aktywny (MARCSTATE=0x0D).");
+  } else {
+    Serial.println("CC1101: NIE wszedl w RX (MARCSTATE=0x01).");
+    if (ccCrystalAlive())
+      Serial.println("CC1101: kwarc pracuje (SCAL -> FS_CAL) - problem po stronie SRX/PLL.");
+    else
+      Serial.println("CC1101: KWARC NIE PRACUJE (SCAL bez reakcji) - zasilanie/kwarc modulu.");
+    if (gRadioVerbose) ccDumpRegs();
+  }
 }
 
 // ==================== TRYB VEVOR YT60309 ====================
@@ -477,7 +659,7 @@ void applyVevorMode() {
 // Parametry wg github.com/FPR36/Vevor-Meteo-station-rf-protocol.
 void applyVevorYT60309Mode() {
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
 
   ccWriteFreq(0x21, 0x65, 0xE8);  // 868.35 MHz (domyślnie)
 
@@ -496,7 +678,7 @@ void applyVevorYT60309Mode() {
 
   delay(3);
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
   ccStrobe(0x34);  // SRX
 }
 
@@ -508,7 +690,7 @@ void applyVevorYT60309Mode() {
 // Parametry RF wg matthias-bs/BresserWeatherSensorReceiver (CC1101).
 void applyBresserMode() {
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
 
   ccWriteFreq(0x21, 0x65, 0x6A);  // 868.30 MHz (domyślnie)
 
@@ -527,7 +709,7 @@ void applyBresserMode() {
 
   delay(3);
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
   ccStrobe(0x34);  // SRX
 }
 
@@ -561,21 +743,14 @@ void loopFineOffset() {
   uint8_t frame[17];
   memset(frame, 0, sizeof(frame));
 
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(0xFF);  // burst read FIFO
-  for (int i = 0; i < 17; i++) {
-    frame[i] = ccXfer(0);
-  }
-  radioSPI.endTransaction();
-  csHigh();
+  ccReadFifo(frame, 17);
 
   int rssiRaw = ccStatusRead(0x34);  // RSSI
   int rssi = calculateRSSI(rssiRaw);
 
   // Zresetuj RX po odczycie
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
   ccStrobe(0x34);  // SRX
 
   totalFrames++;  // każdy pakiet z poprawnym sync word
@@ -620,18 +795,67 @@ void loopFineOffset() {
 // Radio dziala bez hardware sync (nieskonczona dlugosc). Dekoder utrzymuje
 // bufor kołowy surowych bajtów i szuka wzorca "CA 54" (sync) - po nim nastepuje
 // 28-bajtowy payload zaczynajacy sie od 0xAA 0x00. Metoda potwierdzona snifferem.
+// Sprawdza, czy CC1101 nadal odpowiada po SPI. Jesli nie - reinicjalizuje go.
+// Zabezpieczenie przed trwalym "zawieszeniem" radia (zdarza sie, gdy petla
+// glowna obraca sie bardzo szybko, np. na klasycznym ESP32).
+void radioHealthGuard() {
+  static unsigned long lastCheck = 0;
+  static unsigned long lastReinit = 0;
+  if (millis() - lastCheck < 5000) return;
+  lastCheck = millis();
+
+  // Odczyt VERSION kilka razy - pojedynczy bledny odczyt nie moze
+  // wywolywac pelnej reinicjalizacji radia.
+  int good = 0;
+  for (int i = 0; i < 5; i++) {
+    if (ccStatusRead(0x31) == 0x14) good++;
+    delayMicroseconds(200);
+  }
+  if (good >= 2) return;
+
+  // Radio naprawde nie odpowiada. Reinicjalizuj, ale nie czesciej niz raz
+  // na 15 s - inaczej przy trwale uszkodzonym module powstaje petla resetow.
+  if (millis() - lastReinit < 15000) return;
+  lastReinit = millis();
+
+  Serial.println("CC1101 nie odpowiada po SPI - reinicjalizacja radia");
+  ccInitBase();
+  applyVevorMode();
+}
+
 void loopVevor() {
   static uint8_t rbuf[1024];
   static int rhead = 0, rcount = 0;
 
-  // Radio musiało wpaść w overflow (nieskończona długość) - wróć do RX.
-  if ((ccStatusRead(0x35) & 0x1F) != 0x0D) {
-    ccStrobe(0x3A);  // SFRX
-    ccStrobe(0x34);  // SRX
-  }
+  radioHealthGuard();
 
   uint8_t rxBytes = ccStatusRead(0x3B) & 0x7F;  // RXBYTES
   if (rxBytes == 0) {
+    // Bufor pusty. Stan radia sprawdzamy RZADKO - częste strobowanie SRX
+    // trwale blokuje CC1101 (potwierdzone testem: po ~265 strobach pada
+    // i przestaje odpowiadać po SPI az do restartu).
+    static unsigned long lastStateCheck = 0;
+    if (millis() - lastStateCheck >= 30000) {
+      lastStateCheck = millis();
+      uint8_t ms = ccStatusRead(0x35) & 0x1F;
+      if (ms != 0x0D) {
+        Serial.print("CC1101 nie odbiera (MARCSTATE=0x");
+        Serial.print(ms, HEX);
+        Serial.println(") - restart odbioru");
+        ccStartRx();
+      }
+    }
+    delay(1);
+    return;
+  }
+
+  // Bufor prawie pelny - wyczysc i wroc do RX, ale nie częściej niż raz na sekundę.
+  if (rxBytes >= 120) {
+    static unsigned long lastFlush = 0;
+    if (millis() - lastFlush >= 1000) {
+      lastFlush = millis();
+      ccStartRx();
+    }
     delay(1);
     return;
   }
@@ -639,12 +863,7 @@ void loopVevor() {
   int n = rxBytes < 64 ? rxBytes : 64;
   uint8_t tmp[64];
 
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(0xFF);  // burst read FIFO
-  for (int i = 0; i < n; i++) tmp[i] = (uint8_t)ccXfer(0);
-  radioSPI.endTransaction();
-  csHigh();
+  ccReadFifo(tmp, n);
 
   int rssi = calculateRSSI(ccStatusRead(0x34));
 
@@ -706,20 +925,13 @@ void loopVevorYT60309() {
   uint8_t frame[32];
   memset(frame, 0, sizeof(frame));
 
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(0xFF);  // burst read FIFO
-  for (int i = 0; i < 32; i++) {
-    frame[i] = ccXfer(0);
-  }
-  radioSPI.endTransaction();
-  csHigh();
+  ccReadFifo(frame, 32);
 
   int rssiRaw = ccStatusRead(0x34);  // RSSI
   int rssi = calculateRSSI(rssiRaw);
 
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
   ccStrobe(0x34);  // SRX
 
   totalFrames++;  // każdy pakiet z poprawnym sync word
@@ -775,20 +987,13 @@ void loopBresser() {
   uint8_t frame[27];
   memset(frame, 0, sizeof(frame));
 
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(0xFF);  // burst read FIFO
-  for (int i = 0; i < 27; i++) {
-    frame[i] = ccXfer(0);
-  }
-  radioSPI.endTransaction();
-  csHigh();
+  ccReadFifo(frame, 27);
 
   int rssiRaw = ccStatusRead(0x34);  // RSSI
   int rssi = calculateRSSI(rssiRaw);
 
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
   ccStrobe(0x34);  // SRX
 
   totalFrames++;  // każdy pakiet z poprawnym sync word
@@ -854,7 +1059,7 @@ void loopBresser() {
 // danej częstotliwości coś nadaje (max wyraźnie wyższy od szumu ~-95 dBm).
 void applyProbe() {
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
 
   if (probeFreqIdx == 6) {
     // 433.92 MHz (test: sprawdzenie czy RSSI -19 dotyczy tylko pasma 868 MHz)
@@ -886,7 +1091,7 @@ void applyProbe() {
 
   delay(3);
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
   ccStrobe(0x34);  // SRX
 }
 
@@ -900,7 +1105,7 @@ void loopProbe() {
   uint8_t st = ccStatusRead(0x35) & 0x1F;   // MARCSTATE (0x0D = RX)
   if (st != 0x0D) {
     ccStrobe(0x36);  // SIDLE
-    ccStrobe(0x3A);  // SFRX
+    ccStrobe(CC_SFRX);  // SFRX
     ccStrobe(0x34);  // SRX
     delay(1);
   }
@@ -913,12 +1118,8 @@ void loopProbe() {
   uint8_t rxBytes = ccStatusRead(0x3B) & 0x7F;
   if (rxBytes > 0) {
     int n = rxBytes < 64 ? rxBytes : 64;
-    csLow();
-    radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-    ccXfer(0xFF);
-    for (int i = 0; i < n; i++) ccXfer(0);
-    radioSPI.endTransaction();
-    csHigh();
+    uint8_t tmp[64];
+    ccReadFifo(tmp, n);
   }
 
   unsigned long now = millis();
@@ -944,7 +1145,7 @@ bool captureMode = false;
 
 void applyCapture() {
   ccStrobe(0x36);
-  ccStrobe(0x3A);
+  ccStrobe(CC_SFRX);
 
   ccWrite(0x0D, 0x21);  // 868.35 MHz
   ccWrite(0x0E, 0x65);
@@ -962,7 +1163,7 @@ void applyCapture() {
 
   delay(3);
   ccStrobe(0x36);
-  ccStrobe(0x3A);
+  ccStrobe(CC_SFRX);
   ccStrobe(0x34);  // SRX
 }
 
@@ -976,18 +1177,13 @@ void loopCapture() {
   uint8_t buf[64];
   int n = rxBytes < 64 ? rxBytes : 64;
 
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(0xFF);
-  for (int i = 0; i < n; i++) buf[i] = ccXfer(0);
-  radioSPI.endTransaction();
-  csHigh();
+  ccReadFifo(buf, n);
 
   int rssiRaw = ccStatusRead(0x34);
   int rssi = calculateRSSI(rssiRaw);
 
   ccStrobe(0x36);
-  ccStrobe(0x3A);
+  ccStrobe(CC_SFRX);
   ccStrobe(0x34);
 
   if (rssi > -75) {
@@ -1079,17 +1275,12 @@ void loopAuto() {
   uint8_t frame[32];
   memset(frame, 0, sizeof(frame));
 
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(0xFF);
-  for (int i = 0; i < need; i++) frame[i] = ccXfer(0);
-  radioSPI.endTransaction();
-  csHigh();
+  ccReadFifo(frame, need);
 
   int rssi = calculateRSSI(ccStatusRead(0x34));
 
   ccStrobe(0x36);
-  ccStrobe(0x3A);
+  ccStrobe(CC_SFRX);
   ccStrobe(0x34);
 
   autoSync[autoIdx]++;
@@ -1488,10 +1679,11 @@ Preferences modePrefs;
 void loadRxMode() {
   modePrefs.begin("mode", false);
   if (!modePrefs.getBool("init", false)) {
-    modePrefs.putInt("rxMode", MODE_RAW_SCAN);
+    // Domyślnie: odbiornik stacji pogodowej VEVOR/Youtong 7-in-1 (868.30 MHz).
+    modePrefs.putInt("rxMode", MODE_VEVOR_7IN1);
     modePrefs.putBool("init", true);
   }
-  rxMode = (RxMode)modePrefs.getInt("rxMode", MODE_RAW_SCAN);
+  rxMode = (RxMode)modePrefs.getInt("rxMode", MODE_VEVOR_7IN1);
   if (rxMode != MODE_RAW_SCAN && rxMode != MODE_FINE_OFFSET && rxMode != MODE_VEVOR_7IN1 && rxMode != MODE_BRESSER && rxMode != MODE_VEVOR_YT60309 && rxMode != MODE_WEATHER_AUTO) rxMode = MODE_RAW_SCAN;
   modePrefs.end();
 }
@@ -2720,26 +2912,10 @@ void handleSendTest() {
 // (tysiace razy na sekunde) i mierzy realna dlugosc paczki oraz odstepy miedzy
 // nimi. Nadajnik stacji pogodowej = krotkie paczki (kilkadziesiat ms) powtarzane
 // cyklicznie (co ~16-20 s). Zaklócenie = pojedyncze, nieregularne skoki.
-// Odczyt FIFO odbiornika. dst == NULL -> tylko oproznij (trzyma RSSI zywym).
-static int ccReadFifo(uint8_t* dst, int maxBytes) {
-  uint8_t rb = ccStatusRead(0x3B) & 0x7F;
-  if (!rb) return 0;
-  int n = rb < maxBytes ? rb : maxBytes;
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(0xFF);  // burst read RXFIFO
-  for (int i = 0; i < n; i++) {
-    uint8_t v = (uint8_t)ccXfer(0);
-    if (dst) dst[i] = v;
-  }
-  radioSPI.endTransaction();
-  csHigh();
-  return n;
-}
-
+// Odczyt FIFO odbiornika (funkcja ccReadFifo zdefiniowana wyzej).
 String burstScan(float mhz, int secs, bool wide, int agc) {
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
 
   uint32_t w = (uint32_t)((double)mhz * 1e6 * 65536.0 / 26e6 + 0.5);
   ccWrite(0x0D, (w >> 16) & 0xFF);
@@ -2765,7 +2941,7 @@ String burstScan(float mhz, int secs, bool wide, int agc) {
   ccStrobe(0x36);  // SIDLE
   ccStrobe(0x33);  // SCAL - kalibracja syntezera/front-endu przed nasluchem
   delay(2);
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
   ccStrobe(0x34);  // SRX
   delay(5);
 
@@ -2833,18 +3009,14 @@ String burstScan(float mhz, int secs, bool wide, int agc) {
       if ((ccStatusRead(0x35) & 0x1F) == 0x0D) {
         rxOk++;
       } else {
-        ccStrobe(0x3A);  // SFRX
+        ccStrobe(CC_SFRX);  // SFRX
         ccStrobe(0x34);  // SRX - wroc do odbioru
       }
       uint8_t rb = ccStatusRead(0x3B) & 0x7F;
       if (rb) {
         int n2 = rb < 64 ? rb : 64;
-        csLow();
-        radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-        ccXfer(0xFF);  // burst read RXFIFO
-        for (int i = 0; i < n2; i++) ccXfer(0);
-        radioSPI.endTransaction();
-        csHigh();
+        uint8_t tmp[64];
+        ccReadFifo(tmp, n2);
         drained += n2;
       }
       if (micros() >= endUs) break;
@@ -2922,7 +3094,7 @@ static uint8_t sniffBuf[420];
 
 String sniffRun(float mhz, float kbaud, bool ook, int agc, int secs) {
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
 
   uint32_t w = (uint32_t)((double)mhz * 1e6 * 65536.0 / 26e6 + 0.5);
   ccWrite(0x0D, (w >> 16) & 0xFF);
@@ -2950,7 +3122,7 @@ String sniffRun(float mhz, float kbaud, bool ook, int agc, int secs) {
   ccStrobe(0x36);
   ccStrobe(0x33);  // SCAL
   delay(2);
-  ccStrobe(0x3A);
+  ccStrobe(CC_SFRX);
   ccStrobe(0x34);
 
   // Mediana szumu (odporna na skoki od wlasnego WiFi ESP32).
@@ -2979,7 +3151,7 @@ String sniffRun(float mhz, float kbaud, bool ook, int agc, int secs) {
     // zamarza - wtedy zaden burst nie zostanie wykryty.
     ccReadFifo(NULL, 64);
     if ((++guard & 0xFF) == 0 && (ccStatusRead(0x35) & 0x1F) != 0x0D) {
-      ccStrobe(0x3A);  // SFRX
+      ccStrobe(CC_SFRX);  // SFRX
       ccStrobe(0x34);  // SRX
     }
     if (r < thrHi) continue;
@@ -3273,12 +3445,14 @@ void setup() {
   Serial.print(ccStatusRead(0x31), HEX);
   Serial.print(" PARTNUM=0x");
   Serial.println(ccStatusRead(0x30), HEX);
+  ccSpiAutotune();
   loadRxMode();
   if (rxMode == MODE_FINE_OFFSET) {
     applyFineOffsetMode();
     Serial.println("CC1101 gotowy. Tryb: Fine Offset WH65 (VEVOR YT60309) - nasluch 868.30 MHz.");
   } else if (rxMode == MODE_VEVOR_7IN1) {
     applyVevorMode();
+    gRadioVerbose = false;
     Serial.println("CC1101 gotowy. Tryb: VEVOR / Youtong 7-in-1 - nasluch 868.30 MHz.");
   } else if (rxMode == MODE_VEVOR_YT60309) {
     applyVevorYT60309Mode();
@@ -3373,6 +3547,14 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  // Co 30 s sprawdzamy, czy zapisy do CC1101 nadal docieraja, i w razie
+  // potrzeby dobieramy wolniejsza predkosc SPI (dlugie kable, slaby kontakt).
+  static unsigned long lastSpiCheck = 0;
+  if (millis() - lastSpiCheck >= 30000) {
+    lastSpiCheck = millis();
+    ccSpiAutotune();
+  }
+
   // Tryb sondy RSSI ma priorytet
   if (probeFreqIdx >= 0) {
     loopProbe();
@@ -3425,7 +3607,7 @@ void loop() {
   // Prawie pełne FIFO -> zresetuj, żeby nie zgubić danych
   if (rxBytes >= 200) {
     ccStrobe(0x36);  // SIDLE
-    ccStrobe(0x3A);  // SFRX
+    ccStrobe(CC_SFRX);  // SFRX
     ccStrobe(0x34);  // SRX
     return;
   }
@@ -3433,13 +3615,7 @@ void loop() {
   uint8_t frame[256];
   memset(frame, 0, sizeof(frame));
 
-  csLow();
-  radioSPI.beginTransaction(SPISettings(SPI_HZ, MSBFIRST, SPI_MODE0));
-  ccXfer(0xFF);  // burst read FIFO
-  for (int i = 0; i < rxBytes; i++) {
-    frame[i] = ccXfer(0);
-  }
-  radioSPI.endTransaction();
+  ccReadFifo(frame, rxBytes);
   csHigh();
 
   int rssiRaw = ccStatusRead(0x34);  // RSSI
@@ -3448,7 +3624,7 @@ void loop() {
 
   // Zresetuj RX po odczycie
   ccStrobe(0x36);  // SIDLE
-  ccStrobe(0x3A);  // SFRX
+  ccStrobe(CC_SFRX);  // SFRX
   ccStrobe(0x34);  // SRX
 
   // Filtruj szum
