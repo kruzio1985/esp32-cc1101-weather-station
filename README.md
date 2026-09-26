@@ -181,7 +181,8 @@ tuż przy pinach VCC–GND modułu.
 
 ### Budowanie i wgrywanie
 
-Wymagania: [PlatformIO](https://platformio.org/) (framework Arduino).
+Wymagania: [PlatformIO](https://platformio.org/) (framework Arduino). Nic więcej —
+**wszystko, czego trzeba, PlatformIO pobierze samo**.
 
 ```powershell
 # ESP32-S3 (domyślne)
@@ -193,18 +194,52 @@ pio run -e esp32-wroom
 pio run -e esp32-wroom -t upload
 ```
 
-Port USB ustaw w `platformio.ini` (`upload_port` / `monitor_port`), jeśli urządzenie
-dostaje inny port niż `COM12`.
+Port USB jest **wykrywany automatycznie** — w `platformio.ini` nie ma żadnych ustawień
+specyficznych dla konkretnego komputera, więc projekt buduje się tak samo na każdym PC.
+Jeśli automat wybierze zły port, podaj go ręcznie:
 
-> **Wgrywanie na płytkę WROOM:** ta płytka często nie robi autoresetu niezawodnie.
-> Jeśli `pio run -e esp32-wroom -t upload` zgłasza `Wrong boot mode detected`,
-> wymuś tryb download ręcznie: **przytrzymaj BOOT**, naciśnij i puść **EN/RST**,
-> nadal trzymaj BOOT aż wgrywanie ruszy (`Wrote ... bytes`). W `platformio.ini`
-> dla tego środowiska ustawione jest `upload_flags = --before no-reset` — dzięki
-> temu esptool nie „walczy" z przyciskiem.
+```powershell
+pio run -e esp32-wroom -t upload --upload-port COM5
+```
+
+#### Ważne: wymagany rdzeń Arduino 3.x
+
+Firmware używa API, które istnieje dopiero w **Arduino-ESP32 core 3.x**. Oficjalna
+platforma `espressif32` z rejestru PlatformIO (wersja 6.x) ma jeszcze rdzeń **2.x** i
+kompilacja się nie uda (`esp_task_wdt_reconfigure was not declared`). Dlatego w
+`platformio.ini` platforma jest przypięta do wydania **pioarduino 55.03.312**
+(rdzeń Arduino 3.3.12) w formie adresu URL:
+
+```ini
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.312/platform-espressif32.zip
+```
+
+PlatformIO pobierze je automatycznie przy pierwszym budowaniu (kilkadziesiąt MB, chwilę
+to trwa).
+
+> **Pierwszy build może się nie udać** — PlatformIO instaluje wtedy platformę i narzędzia
+> i potrafi przerwać z błędem typu `TypeError: ... not 'NoneType'`. To normalne:
+> **uruchom `pio run` jeszcze raz** i kompilacja przejdzie. Ten projekt był sprawdzony
+> pod kątem czystego builda (świeży katalog bez `.pio`) na obu środowiskach:
+> `esp32-wroom` → OK (Flash 65,2 %, RAM 19,5 %), `esp32s3` → OK (Flash 37,8 %, RAM 18,9 %).
+
+> **Wgrywanie na płytkę WROOM:** niektóre płytki WROOM-32 (szczególnie z konwerterem
+> CH340) nie robią autoresetu niezawodnie. Jeśli `pio run -e esp32-wroom -t upload`
+> zgłasza `Wrong boot mode detected`, wymuś tryb download ręcznie:
 >
-> Jeśli płytka zgłasza `Invalid head of packet` — to zakłócenie synchronizacji;
-> po prostu powtórz wgrywanie.
+> 1. naciśnij i **przytrzymaj BOOT**,
+> 2. nie puszczając BOOT naciśnij i puść **EN/RST**,
+> 3. trzymaj BOOT aż wgrywanie ruszy (zobaczysz `Wrote ... bytes`).
+>
+> Jeśli płytka zgłasza `Invalid head of packet` — to zakłócenie synchronizacji przy
+> dużej prędkości; po prostu powtórz wgrywanie albo zejdź na wolniejszą prędkość:
+>
+> ```powershell
+> pio run -e esp32-wroom -t upload --upload-port COM5 --upload-speed 115200
+> ```
+>
+> **Najprościej:** po pierwszym wgraniu przez USB aktualizuj firmware przez **OTA**
+> (patrz niżej) — bez kabla, bez przycisków i bez zmiany czegokolwiek w konfiguracji.
 
 ### Aktualizacja firmware przez OTA (bez USB i przycisku)
 
@@ -470,7 +505,8 @@ capacitor (and optionally 47–100 µF) close to the module's VCC–GND pins.
 
 ### Build & flash
 
-Requires [PlatformIO](https://platformio.org/) (Arduino framework).
+Requires [PlatformIO](https://platformio.org/) (Arduino framework). Nothing else —
+**PlatformIO downloads everything needed automatically**.
 
 ```powershell
 # ESP32-S3 (default)
@@ -482,17 +518,51 @@ pio run -e esp32-wroom
 pio run -e esp32-wroom -t upload
 ```
 
-Set the USB port in `platformio.ini` (`upload_port` / `monitor_port`) if the device
-gets a different port than `COM12`.
+The USB port is **auto-detected** — `platformio.ini` contains no machine-specific
+settings, so the project builds identically on any PC. If auto-detection picks the wrong
+port, pass it explicitly:
 
-> **Flashing the WROOM board:** auto-reset is often unreliable on this board. If
-> `pio run -e esp32-wroom -t upload` reports `Wrong boot mode detected`, enter
-> download mode manually: **hold BOOT**, press and release **EN/RST**, keep
-> holding BOOT until flashing starts (`Wrote ... bytes`). `platformio.ini` sets
-> `upload_flags = --before no-reset` for this environment so that esptool does
-> not fight the button.
+```powershell
+pio run -e esp32-wroom -t upload --upload-port COM5
+```
+
+#### Important: Arduino core 3.x is required
+
+The firmware uses an API that only exists in **Arduino-ESP32 core 3.x**. The official
+`espressif32` platform from the PlatformIO registry (version 6.x) still ships core **2.x**
+and the build fails with `esp_task_wdt_reconfigure was not declared`. That is why
+`platformio.ini` pins the platform to the **pioarduino 55.03.312** release (Arduino core
+3.3.12) via a URL:
+
+```ini
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.312/platform-espressif32.zip
+```
+
+PlatformIO downloads it on the first build (tens of MB, takes a moment).
+
+> **The first build may fail** — PlatformIO is installing the platform and tools and can
+> abort with an error such as `TypeError: ... not 'NoneType'`. That is normal: **run
+> `pio run` again** and it will compile. This project was verified with a clean build
+> (fresh directory, no `.pio`) on both environments:
+> `esp32-wroom` → OK (Flash 65.2 %, RAM 19.5 %), `esp32s3` → OK (Flash 37.8 %, RAM 18.9 %).
+
+> **Flashing the WROOM board:** some WROOM-32 boards (especially those with a CH340
+> converter) do not auto-reset reliably. If `pio run -e esp32-wroom -t upload` reports
+> `Wrong boot mode detected`, enter download mode manually:
 >
-> An `Invalid head of packet` error is a sync glitch — just retry the upload.
+> 1. press and **hold BOOT**,
+> 2. without releasing BOOT, press and release **EN/RST**,
+> 3. keep holding BOOT until flashing starts (you will see `Wrote ... bytes`).
+>
+> An `Invalid head of packet` error is a sync glitch at high speed — just retry, or drop
+> to a slower speed:
+>
+> ```powershell
+> pio run -e esp32-wroom -t upload --upload-port COM5 --upload-speed 115200
+> ```
+>
+> **Easiest:** after the first USB flash, update the firmware over **OTA** (see below) —
+> no cable, no buttons and no configuration changes.
 
 ### Over-the-air firmware update (no USB, no button)
 

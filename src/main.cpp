@@ -454,14 +454,21 @@ const uint32_t WDT_TIMEOUT_S = 30;
 bool wdtEnabled = false;
 
 void wdtBegin() {
+  esp_err_t err = ESP_FAIL;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+  // ESP-IDF 5.1+ (Arduino core 3.x): konfiguracja przez strukture.
   esp_task_wdt_config_t cfg = {};
   cfg.timeout_ms     = WDT_TIMEOUT_S * 1000;
   cfg.idle_core_mask = 0;      // nie pilnuj zadań idle
   cfg.trigger_panic  = true;   // przy przekroczeniu -> restart
-
-  esp_err_t err = esp_task_wdt_reconfigure(&cfg);
+  err = esp_task_wdt_reconfigure(&cfg);
   if (err != ESP_OK) err = esp_task_wdt_init(&cfg);
-  if (err == ESP_OK)   err = esp_task_wdt_add(NULL);   // pilnuj loopTask
+#else
+  // Starszy ESP-IDF (Arduino core 2.x): prostsze API.
+  err = esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  if (err == ESP_ERR_INVALID_STATE) err = ESP_OK;   // juz zainicjalizowany
+#endif
+  if (err == ESP_OK) err = esp_task_wdt_add(NULL);  // pilnuj loopTask
   wdtEnabled = (err == ESP_OK);
 }
 
