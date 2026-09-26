@@ -21,6 +21,10 @@
 #include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <Update.h>
+#include <LittleFS.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
+#include <time.h>
 #include "decoders.h"
 
 // ==================== KONFIGURACJA ====================
@@ -55,7 +59,7 @@ struct WifiCfg {
 };
 WifiCfg wifiCfg;
 
-// Filtr ramek: radio odbiera nadal WSZYSTKO, ale gdy filtr jest włączony,
+// Filtr ramek / Frame filter: radio odbiera nadal WSZYSTKO, ale gdy filtr jest włączony,
 // do bufora (strona WWW / JSON / później RS485) trafiają tylko ramki pasujące
 // do wzorca (np. identyfikator urządzenia stacji pogody). Reszta jest tylko
 // zliczana i pokazywana na porcie szeregowym.
@@ -291,6 +295,280 @@ unsigned long rejectedFrames = 0; // odrzucone przez filtr
 unsigned long startTime = 0;
 int comboHits[6][8];  // licznik trafień per (freq, prof)
 
+// ==================== LOG ZDARZEŃ / DIAGNOSTYKA SYSTEMU ====================
+// Prosty log w RAM (bufor kołowy) + liczniki w pamięci RTC, która przeżywa
+// restart (ale NIE odcięcie zasilania). Dzięki temu po nieoczekiwanym
+// restarcie widać, co było przyczyną (watchdog? brownout? crash?).
+enum LogLevel { LOG_INFO = 0, LOG_WARN = 1, LOG_ERROR = 2 };
+
+struct LogEntry {
+  unsigned long t;      // ms od startu
+  uint8_t level;
+  char msg[72];
+};
+const int MAX_LOG = 40;
+LogEntry eventLog[MAX_LOG];
+int logHead = 0;
+int logCount = 0;
+
+void logEvent(uint8_t level, const String& msg) {
+  LogEntry& e = eventLog[logHead];
+  e.t = millis() - startTime;
+  e.level = level;
+  strncpy(e.msg, msg.c_str(), sizeof(e.msg) - 1);
+  e.msg[sizeof(e.msg) - 1] = 0;
+  logHead = (logHead + 1) % MAX_LOG;
+  if (logCount < MAX_LOG) logCount++;
+}
+
+// Deklaracja w przód - errFileAppend jest zdefiniowana niżej (sekcja pliku błędów).
+void errFileAppend(const String& msg);
+
+// Zdarzenia trafiają też na port szeregowy (żeby dało się podejrzeć po USB).
+// BŁĘDY dodatkowo lądują w pliku na flashu (z rotacją - patrz errFileAppend).
+void logEventS(uint8_t level, const String& msg) {
+  logEvent(level, msg);
+  Serial.print("[");
+  Serial.print((millis() - startTime) / 1000);
+  Serial.print("s] ");
+  Serial.print(level == LOG_ERROR ? "BLAD  " : (level == LOG_WARN ? "UWAGA " : "INFO  "));
+  Serial.println(msg);
+  if (level == LOG_ERROR) errFileAppend(msg);
+}
+
+// --- Pamięć RTC: przeżywa restart programowy / watchdog / panic ---
+// UWAGA: musi być RTC_NOINIT_ATTR, a NIE RTC_DATA_ATTR. Sekcja .rtc.data
+// jest przy każdym starcie kopiowana z flasha (czyli zerowana), więc liczniki
+// restartów zawsze pokazywałyby 1. Sekcja .rtc.noinit nie jest inicjalizowana,
+// dlatego po włączeniu zasilania zawiera śmieci - rozpoznajemy to po "magii".
+#define RTC_MAGIC 0xC0FFEE42u
+RTC_NOINIT_ATTR uint32_t rtcMagic;
+RTC_NOINIT_ATTR uint32_t rtcBootCount;
+RTC_NOINIT_ATTR uint32_t rtcWdtResets;
+RTC_NOINIT_ATTR uint32_t rtcBrownouts;
+RTC_NOINIT_ATTR uint32_t rtcPanics;
+RTC_NOINIT_ATTR uint32_t rtcHangResets;
+RTC_NOINIT_ATTR uint32_t rtcLastMaxLoopMs;
+
+// --- Bieżące statystyki (kasowane przy starcie) ---
+uint32_t statMaxLoopMs   = 0;    // najdłuższe wykonanie loop() w tej sesji
+uint32_t statLoopCount   = 0;
+uint32_t statRadioReinit = 0;    // ile razy reinicjalizowano radio
+uint32_t statRxRestarts  = 0;    // ile razy restartowano odbiór (SRX)
+uint32_t statWifiRecon   = 0;    // ile razy łączyło się ponownie z WiFi
+uint32_t statSpiFallback = 0;    // ile razy obniżono prędkość SPI
+uint32_t statHeapMin     = 0xFFFFFFFF;
+int      statLastLoopMs  = 0;
+
+const char* resetReasonText(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "wlaczenie zasilania";
+    case ESP_RST_EXT:       return "reset zewnetrzny (EN/RST)";
+    case ESP_RST_SW:        return "restart programowy";
+    case ESP_RST_PANIC:     return "PANIC - crash firmware";
+    case ESP_RST_INT_WDT:   return "watchdog przerwan - ZAWIESZENIE";
+    case ESP_RST_TASK_WDT:  return "watchdog zadania - ZAWIESZENIE";
+    case ESP_RST_WDT:       return "watchdog - ZAWIESZENIE";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT - spadek napiecia!";
+    case ESP_RST_DEEPSLEEP: return "wybudzenie z deep sleep";
+    case ESP_RST_SDIO:      return "reset SDIO";
+    default:                return "nieznany";
+  }
+}
+
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+
+// ==================== WATCHDOG ====================
+// Sprzętowy watchdog zadania (TWDT). Jeśli loop() nie "nakarmi" go przez
+// WDT_TIMEOUT_S sekund, ESP restartuje się sam. Chroni przed zawieszeniem
+// (np. zakleszczeniem na SPI albo nieskończoną pętlą).
+const uint32_t WDT_TIMEOUT_S = 30;
+bool wdtEnabled = false;
+
+void wdtBegin() {
+  esp_task_wdt_config_t cfg = {};
+  cfg.timeout_ms     = WDT_TIMEOUT_S * 1000;
+  cfg.idle_core_mask = 0;      // nie pilnuj zadań idle
+  cfg.trigger_panic  = true;   // przy przekroczeniu -> restart
+
+  esp_err_t err = esp_task_wdt_reconfigure(&cfg);
+  if (err != ESP_OK) err = esp_task_wdt_init(&cfg);
+  if (err == ESP_OK)   err = esp_task_wdt_add(NULL);   // pilnuj loopTask
+  wdtEnabled = (err == ESP_OK);
+}
+
+inline void wdtFeed() { if (wdtEnabled) esp_task_wdt_reset(); }
+
+// ==================== PLIK BŁĘDÓW (LittleFS) ====================
+// Do pliku trafiają TYLKO błędy. Zwykłe zdarzenia (INFO/UWAGA) zostają w RAM
+// (bufor kołowy, max 40 wpisów - najstarsze są nadpisywane), żeby nie zużywać
+// flasha i nie zapełniać pamięci.
+//
+// Rotacja, żeby RAM i miejsce na flashu nigdy się nie skończyły:
+//   - plik ma maksymalny rozmiar ERR_MAX_BYTES (16 KB),
+//   - po przekroczeniu zostają tylko najnowsze wpisy (do ERR_KEEP_BYTES),
+//   - dodatkowo kasowane są wpisy starsze niż ERR_KEEP_DAYS (7 dni),
+//   - to wszystko przy KAŻDYM zapisie, więc rozmiar jest zawsze ograniczony.
+const char* ERR_FILE       = "/bledy.log";
+const size_t ERR_MAX_BYTES = 16384;   // 16 KB - od tego momentu rotacja
+const size_t ERR_KEEP_BYTES= 8192;    // po rotacji zostaje najnowsze 8 KB
+const int    ERR_KEEP_DAYS = 7;       // kasuj wpisy starsze niż 7 dni
+bool fsReady    = false;
+bool ntpSynced  = false;
+uint32_t errFileLines = 0;
+
+String timestampStr() {
+  struct tm ti;
+  if (ntpSynced && getLocalTime(&ti, 0)) {
+    char b[24];
+    snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
+             ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday, ti.tm_hour, ti.tm_min, ti.tm_sec);
+    return String(b);
+  }
+  // Brak czasu z sieci - zapisujemy czas pracy (i tak rotacja dziala po rozmiarze).
+  return "up+" + String((millis() - startTime) / 1000) + "s";
+}
+
+// Wyciąga czas z linii "2026-09-26 23:45:12 | ...". Zwraca 0, gdy się nie uda.
+time_t parseLineTime(const String& line) {
+  if (line.length() < 19 || line[4] != '-') return 0;
+  struct tm ti = {};
+  ti.tm_year = line.substring(0, 4).toInt() - 1900;
+  ti.tm_mon  = line.substring(5, 7).toInt() - 1;
+  ti.tm_mday = line.substring(8, 10).toInt();
+  ti.tm_hour = line.substring(11, 13).toInt();
+  ti.tm_min  = line.substring(14, 16).toInt();
+  ti.tm_sec  = line.substring(17, 19).toInt();
+  ti.tm_isdst = -1;
+  return mktime(&ti);
+}
+
+// Przycina plik: usuwa wpisy starsze niż 7 dni i nadmiar powyżej limitu.
+void errFileRotate(bool force) {
+  if (!fsReady) return;
+  File f = LittleFS.open(ERR_FILE, "r");
+  if (!f) return;
+  size_t sz = f.size();
+  if (!force && sz <= ERR_MAX_BYTES) { f.close(); return; }
+
+  // Wczytaj plik linia po linii i zatrzymaj tylko wpisy, ktore przetrwaja.
+  time_t now = 0;
+  time_t oldest = 0;
+  if (ntpSynced) { time(&now); oldest = now - (time_t)ERR_KEEP_DAYS * 86400; }
+
+  // Bufor na zachowane linie (nowe na koncu).
+  const int MAXKEEP = 120;
+  String keep[MAXKEEP];
+  int keepN = 0;
+  size_t keptBytes = 0;
+
+  // Najpierw policz, ile linii jest w pliku (do informacji na stronie).
+  errFileLines = 0;
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    errFileLines++;
+
+    // Filtr wieku: tylko gdy znamy prawdziwy czas (NTP).
+    if (oldest) {
+      time_t t = parseLineTime(line);
+      if (t && t < oldest) continue;   // starszy niż 7 dni - pomiń
+    }
+
+    // Trzymamy najnowsze wpisy w oknie ERR_KEEP_BYTES.
+    keep[keepN % MAXKEEP] = line;
+    keepN++;
+    keptBytes += line.length() + 1;
+  }
+  f.close();
+
+  // Zostaw tyle najnowszych wpisow, ile miesci sie w ERR_KEEP_BYTES.
+  int total = (keepN < MAXKEEP) ? keepN : MAXKEEP;
+  int first = 0;
+  size_t bytes = 0;
+  for (int i = total - 1; i >= 0; i--) {
+    int idx = (keepN - 1 - (total - 1 - i)) % MAXKEEP;
+    if (idx < 0) idx += MAXKEEP;
+    bytes += keep[idx].length() + 1;
+    if (bytes > ERR_KEEP_BYTES) { first = i + 1; break; }
+  }
+
+  String out;
+  out.reserve(bytes + 64);
+  for (int i = first; i < total; i++) {
+    int idx = (keepN - total + i) % MAXKEEP;
+    if (idx < 0) idx += MAXKEEP;
+    out += keep[idx];
+    out += '\n';
+  }
+
+  File w = LittleFS.open(ERR_FILE, "w");
+  if (w) {
+    w.print(out);
+    w.close();
+  }
+  errFileLines = 0;
+  for (size_t i = 0; i < out.length(); i++) if (out[i] == '\n') errFileLines++;
+}
+
+// Dopisz błąd do pliku (wywoływane automatycznie przez logEventS dla LOG_ERROR).
+void errFileAppend(const String& msg) {
+  if (!fsReady) return;
+  File f = LittleFS.open(ERR_FILE, "a");
+  if (!f) return;
+  f.print(timestampStr());
+  f.print(" | #");
+  f.print(rtcBootCount);
+  f.print(" | ");
+  f.println(msg);
+  f.close();
+  errFileRotate(false);
+}
+
+void errFileBegin() {
+  fsReady = LittleFS.begin(true);   // true = sformatuj, jeśli trzeba
+  if (fsReady) {
+    Serial.print("LittleFS OK, miejsce: ");
+    Serial.print(LittleFS.totalBytes() / 1024);
+    Serial.println(" kB");
+    errFileRotate(false);
+  } else {
+    Serial.println("LittleFS NIE wystartowal - bledy tylko w RAM");
+  }
+}
+
+// ==================== OCHRONA PAMIĘCI RAM ====================
+// Pilnuje, żeby pamięć się nie wyczerpała po długiej pracy. Log zdarzeń jest
+// buforem kołowym (stały rozmiar), więc sam z siebie nie rośnie - ale gdyby
+// cokolwiek przeciekało, urządzenie restartuje się ZANIM zabraknie RAM.
+const uint32_t HEAP_MIN_ALERT = 25000;    // poziom ostrzeżenia [B]
+const uint32_t HEAP_MIN_RESET = 12000;    // poniżej - restart [B]
+
+void heapGuard() {
+  static unsigned long last = 0;
+  static bool warned = false;
+  if (millis() - last < 60000) return;    // sprawdzaj raz na minutę
+  last = millis();
+
+  uint32_t h = ESP.getFreeHeap();
+  if (h < statHeapMin) statHeapMin = h;
+
+  if (h < HEAP_MIN_RESET) {
+    logEvent(LOG_ERROR, "Krytycznie malo RAM: " + String(h) + " B - restart");
+    errFileAppend("Krytycznie malo RAM: " + String(h) + " B - restart");
+    delay(300);
+    ESP.restart();
+  } else if (h < HEAP_MIN_ALERT && !warned) {
+    warned = true;
+    logEvent(LOG_WARN, "Malo wolnej pamieci RAM: " + String(h) + " B");
+  } else if (h > HEAP_MIN_ALERT * 2) {
+    warned = false;   // pamięć wróciła - uzbrój ostrzeżenie ponownie
+  }
+}
+
+
 // ==================== CC1101 FUNKCJE ====================
 // Prędkość SPI. NIE jest stała - ustala ją automatycznie ccSpiAutotune().
 // Dlaczego: na dłuższych kablach (typowe 10 cm) naruszenie czasu setup/hold
@@ -477,10 +755,15 @@ bool ccSpiAutotune() {
     Serial.print("  -> OK, wybrano ");
     Serial.print(chosen / 1000);
     Serial.println(" kHz");
+    if (chosen < 1000000) {
+      statSpiFallback++;
+      logEventS(LOG_WARN, "SPI obnizone do " + String(chosen / 1000) + " kHz (slabe polaczenie)");
+    }
     return true;
   }
   gSpiHz = 100000;
   Serial.println("  -> BLAD: zapis do CC1101 nie dociera przy zadnej predkosci!");
+  logEventS(LOG_ERROR, "Zapis do CC1101 nie dociera - sprawdz okablowanie");
   return false;
 }
 
@@ -821,6 +1104,8 @@ void radioHealthGuard() {
   lastReinit = millis();
 
   Serial.println("CC1101 nie odpowiada po SPI - reinicjalizacja radia");
+  logEventS(LOG_ERROR, "CC1101 nie odpowiada po SPI - reinicjalizacja");
+  statRadioReinit++;
   ccInitBase();
   applyVevorMode();
 }
@@ -862,6 +1147,8 @@ void loopVevor() {
         Serial.print("CC1101 nie odbiera (MARCSTATE=0x");
         Serial.print(ms, HEX);
         Serial.println(") - restart odbioru");
+        statRxRestarts++;
+        logEventS(LOG_WARN, "Radio nie odbiera (MARCSTATE=0x" + String(ms, HEX) + ") - restart");
         ccStartRx();
       }
     }
@@ -1461,10 +1748,10 @@ void mqttPubDiscoveryAll() {
   mqttPubDiscovery("temperature",    "Temperatura",        "°C",   "temperature",     (p + "/temperature").c_str());
   mqttPubDiscovery("humidity",       "Wilgotnosc",         "%",    "humidity",        (p + "/humidity").c_str());
   mqttPubDiscovery("wind_speed",     "Wiatr",              "m/s",  "wind_speed",      (p + "/wind_speed").c_str());
-  mqttPubDiscovery("wind_gust",      "Wiatr (poryw)",      "m/s",  "wind_speed",      (p + "/wind_gust").c_str());
-  mqttPubDiscovery("wind_direction", "Kierunek wiatru",    "°",    "",                (p + "/wind_direction").c_str());
+  mqttPubDiscovery("wind_gust",      "Wiatr (poryw) / Wind (gust)",      "m/s",  "wind_speed",      (p + "/wind_gust").c_str());
+  mqttPubDiscovery("wind_direction", "Kierunek wiatru / Wind direction",    "°",    "",                (p + "/wind_direction").c_str());
   mqttPubDiscovery("rain",           "Opad",               "mm",   "",                (p + "/rain").c_str());
-  mqttPubDiscovery("uv_index",       "Indeks UV",          "UVI",  "",                (p + "/uv_index").c_str());
+  mqttPubDiscovery("uv_index",       "Indeks UV / UV index",          "UVI",  "",                (p + "/uv_index").c_str());
   mqttPubDiscovery("light",          "Swiatlo",            "lx",   "illuminance",     (p + "/light").c_str());
   mqttPubDiscovery("rssi",           "RSSI",               "dBm",  "signal_strength", (p + "/rssi").c_str());
 }
@@ -1900,7 +2187,6 @@ void handleRoot() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="3">
   <title>868 MHz Weather Sniffer</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1927,15 +2213,20 @@ void handleRoot() {
   </style>
 </head>
 <body>
-  <h1>📡 868 MHz — odbiornik stacji pogodowych</h1>
+  <h1>📡 868 MHz — odbiornik stacji pogodowych / weather station receiver</h1>
   <div style="margin-bottom:12px">
-    <a href="/" style="color:#00d9ff;margin-right:14px;text-decoration:none">📡 Odczyt</a>
-    <a href="/setup" style="color:#00d9ff;margin-right:14px;text-decoration:none">⚙️ Ustawienia</a>
-    <a href="/cal" style="color:#00d9ff;margin-right:14px;text-decoration:none">📐 Kalibracja</a>
-    <a href="/send" style="color:#00d9ff;margin-right:14px;text-decoration:none">📤 Wysyłanie</a>
+    <a href="/" style="color:#00d9ff;margin-right:14px;text-decoration:none">📡 Odczyt / Reading</a>
+    <a href="/setup" style="color:#00d9ff;margin-right:14px;text-decoration:none">⚙️ Ustawienia / Settings</a>
+    <a href="/cal" style="color:#00d9ff;margin-right:14px;text-decoration:none">📐 Kalibracja / Calibration</a>
+    <a href="/send" style="color:#00d9ff;margin-right:14px;text-decoration:none">📤 Wysyłanie / Sending</a>
     <a href="/mqtt" style="color:#00d9ff;margin-right:14px;text-decoration:none">🔌 MQTT</a>
+    <a href="/log" style="color:#00d9ff;margin-right:14px;text-decoration:none">📋 Log</a>
+    <a href="/errors" style="color:#00d9ff;margin-right:14px;text-decoration:none">🚨 Błędy / Errors</a>
+    <a href="/status" style="color:#00d9ff;margin-right:14px;text-decoration:none">🩺 Status JSON</a>
+    <a href="/update" style="color:#00d9ff;margin-right:14px;text-decoration:none">⬆️ OTA</a>
     <a href="/json" style="color:#00d9ff;margin-right:14px;text-decoration:none">JSON</a>
-    <a href="/clear" style="color:#ff6b6b;text-decoration:none">Wyczyść</a>
+    <a href="/reboot" style="color:#ffb84d;margin-right:14px;text-decoration:none">♻️ Restart</a>
+    <a href="/clear" style="color:#ff6b6b;text-decoration:none">Wyczyść / Clear</a>
   </div>
   <div class="stats">
     <div class="stat">
@@ -1952,7 +2243,7 @@ void handleRoot() {
                     ? "868.30 / FSK_8k"
                     : String(FREQ_NAMES[currentFreq]) + " / " + String(PROF_NAMES[currentProf]);
   html += R"(</div>
-      <div class="stat-label">Aktualna kombinacja</div>
+      <div class="stat-label">Aktualna kombinacja / Current setting</div>
     </div>
     <div class="stat">
       <div class="stat-value" style="color:#c084fc">)";
@@ -1963,31 +2254,31 @@ void handleRoot() {
         : (rxMode == MODE_BRESSER) ? "Bresser 5/6/7-in-1"
         : "Skan raw";
   html += R"(</div>
-      <div class="stat-label">Tryb odbioru</div>
+      <div class="stat-label">Tryb odbioru / RX mode</div>
     </div>
     <div class="stat">
-      <div class="stat-value">)";
+      <div class="stat-value" id="stat-frames">)";
   html += String(totalFrames);
   html += R"(</div>
-      <div class="stat-label">Ramek (wszystkie)</div>
+      <div class="stat-label">Ramek (wszystkie) / Frames (all)</div>
     </div>
     <div class="stat">
-      <div class="stat-value" style="color:#6bcb77">)";
+      <div class="stat-value" style="color:#6bcb77" id="stat-accepted">)";
   html += String(acceptedFrames);
   html += R"(</div>
-      <div class="stat-label">Zapisane</div>
+      <div class="stat-label">Zapisane / Stored</div>
     </div>
     <div class="stat">
-      <div class="stat-value" style="color:#ffb84d">)";
+      <div class="stat-value" style="color:#ffb84d" id="stat-rejected">)";
   html += String(rejectedFrames);
   html += R"(</div>
-      <div class="stat-label">Odrzucone (filtr)</div>
+      <div class="stat-label">Odrzucone (filtr) / Rejected (filter)</div>
     </div>
     <div class="stat">
-      <div class="stat-value">)";
+      <div class="stat-value" id="stat-uptime">)";
   html += String((millis() - startTime) / 1000);
   html += R"(s</div>
-      <div class="stat-label">Uptime</div>
+      <div class="stat-label">Uptime / Czas pracy</div>
     </div>
     <div class="stat">
       <div class="stat-value">)";
@@ -1996,7 +2287,7 @@ void handleRoot() {
       <div class="stat-label">IP</div>
     </div>
     <div class="stat">
-      <div class="stat-value" style=")";
+      <div class="stat-value" id="stat-radio" style=")";
   bool radioOk = (radioVersion == 0x14);
   html += (radioOk && radioVersionHits >= 4) ? "color:#6bcb77" : (radioOk ? "color:#ffb84d" : "color:#ff6b6b");
   html += R"(">)";
@@ -2009,7 +2300,7 @@ void handleRoot() {
 
   if (radioVersion != 0x14) {
     html += R"(<div style="background:#3a1a1a;border:1px solid #ff6b6b;padding:14px;border-radius:8px;color:#ffb3b3;margin-bottom:14px">
-      <b>Moduł radiowy CC1101 nie odpowiada po SPI</b> (VERSION=0x)";
+      <b>Moduł radiowy CC1101 nie odpowiada po SPI / CC1101 radio not responding over SPI</b> (VERSION=0x)";
     html += String(radioVersion, HEX);
     html += R"( zamiast 0x14). Sprawdź połączenia: zasilanie 3.3 V, GND, SCK=GPIO)";
     html += String(PIN_SCK);
@@ -2034,7 +2325,7 @@ void handleRoot() {
   }
 
   // --- Sekcja danych pogodowych (dekoder) ---
-  html += R"(<h2>Dane pogodowe (dekoder)</h2>)";
+  html += R"(<h2>Dane pogodowe (dekoder) / Weather data (decoder)</h2>)";
 
   if (rxMode == MODE_RAW_SCAN) {
     html += R"(<div style="background:#16213e;padding:14px;border-radius:8px;color:#888">
@@ -2070,39 +2361,39 @@ void handleRoot() {
     </div>)";
   } else {
     const WeatherData& w = lastWeatherCal;   // wartości po kalibracji
-    html += R"(<table>
-      <tr><th>Parametr</th><th>Wartość</th></tr>)";
-    html += "<tr><td>Model / rodzina</td><td class='mono'>" + w.model + "</td></tr>";
-    html += "<tr><td>ID nadajnika</td><td class='mono'>" + String(w.id) + "</td></tr>";
-    html += "<tr><td>Bateria</td><td>" + String(w.batteryOk ? "OK" : "SLABA") + "</td></tr>";
+    html += R"(<table id="weather-table">
+      <tr><th>Parametr / Parameter</th><th>Wartość / Value</th></tr>)";
+    html += "<tr><td>Model / rodzina (Model / family)</td><td class='mono' id='w-model'>" + w.model + "</td></tr>";
+    html += "<tr><td>ID nadajnika / Transmitter ID</td><td class='mono' id='w-id'>" + String(w.id) + "</td></tr>";
+    html += "<tr><td>Bateria / Battery</td><td id='w-battery'>" + String(w.batteryOk ? "OK" : "SLABA") + "</td></tr>";
     if (w.haveTemp)
-      html += "<tr><td>Temperatura</td><td>" + String(w.tempC, 1) + " &deg;C</td></tr>";
+      html += "<tr><td>Temperatura / Temperature</td><td id='w-temp'>" + String(w.tempC, 1) + " &deg;C</td></tr>";
     if (w.haveHum)
-      html += "<tr><td>Wilgotność</td><td>" + String(w.humidity) + " %</td></tr>";
+      html += "<tr><td>Wilgotność / Humidity</td><td id='w-hum'>" + String(w.humidity) + " %</td></tr>";
     if (w.haveWind)
-      html += "<tr><td>Wiatr (średni)</td><td>" + String(w.windAvgMs, 1) + " m/s (" + String(w.windAvgMs * 3.6f, 1) + " km/h)</td></tr>";
+      html += "<tr><td>Wiatr (średni) / Wind (avg)</td><td id='w-wind'>" + String(w.windAvgMs, 1) + " m/s (" + String(w.windAvgMs * 3.6f, 1) + " km/h)</td></tr>";
     if (w.haveGust)
-      html += "<tr><td>Wiatr (poryw)</td><td>" + String(w.windMaxMs, 1) + " m/s (" + String(w.windMaxMs * 3.6f, 1) + " km/h)</td></tr>";
+      html += "<tr><td>Wiatr (poryw) / Wind (gust)</td><td id='w-gust'>" + String(w.windMaxMs, 1) + " m/s (" + String(w.windMaxMs * 3.6f, 1) + " km/h)</td></tr>";
     if (w.haveWindDir)
-      html += "<tr><td>Kierunek wiatru</td><td>" + String(w.windDirDeg) + "&deg; (" + String(windDirText(w.windDirDeg)) + ")</td></tr>";
+      html += "<tr><td>Kierunek wiatru / Wind direction</td><td id='w-dir'>" + String(w.windDirDeg) + "&deg; (" + String(windDirText(w.windDirDeg)) + ")</td></tr>";
     if (w.haveRain)
-      html += "<tr><td>Opad (od włączenia)</td><td>" + String(w.rainMm, 1) + " mm</td></tr>";
+      html += "<tr><td>Opad (od włączenia) / Rain (since start)</td><td id='w-rain'>" + String(w.rainMm, 1) + " mm</td></tr>";
     if (w.haveUv)
-      html += "<tr><td>Indeks UV</td><td>" + String(w.uvi) + "</td></tr>";
+      html += "<tr><td>Indeks UV / UV index</td><td id='w-uv'>" + String(w.uvi) + "</td></tr>";
     if (w.haveLight) {
       if (w.model == "Vevor-YT60309")
-        html += "<tr><td>Światło</td><td>" + String(w.lightLux, 0) + " W/m²</td></tr>";
+        html += "<tr><td>Światło / Light</td><td id='w-light'>" + String(w.lightLux, 0) + " W/m²</td></tr>";
       else
-        html += "<tr><td>Światło</td><td>" + String(w.lightLux, 0) + " lux (" + String(w.lightLux / 1000.0f, 2) + " k lux)</td></tr>";
+        html += "<tr><td>Światło / Light</td><td id='w-light'>" + String(w.lightLux, 0) + " lux (" + String(w.lightLux / 1000.0f, 2) + " k lux)</td></tr>";
     }
-    html += "<tr><td>RSSI</td><td>" + String(w.rssi) + " dBm</td></tr>";
-    html += "<tr><td>Ostatni pakiet</td><td class='hex'>" + lastDecodedHex + "</td></tr>";
+    html += "<tr><td>RSSI</td><td id='w-rssi'>" + String(w.rssi) + " dBm</td></tr>";
+    html += "<tr><td>Ostatni pakiet / Last packet</td><td class='hex' id='w-hex'>" + lastDecodedHex + "</td></tr>";
     html += R"(</table>)";
   }
 
-  // --- Diagnostyka odbioru (tylko w trybach dekodera) ---
+  // --- Diagnostyka odbioru / Reception diagnostics (tylko w trybach dekodera) ---
   if (rxMode != MODE_RAW_SCAN) {
-    html += R"(<h2>Diagnostyka odbioru</h2>
+    html += R"(<h2>Diagnostyka odbioru / Reception diagnostics</h2>
     <div style="background:#16213e;padding:14px;border-radius:8px;margin-bottom:12px;color:#bbb">
       Pakiety z poprawnym sync word: <b style="color:#00d9ff">)";
     html += String(diagTotal);
@@ -2123,7 +2414,7 @@ void handleRoot() {
       </div>)";
     } else {
       html += R"(<table>
-        <tr><th>Czas</th><th>RSSI</th><th>Długość</th><th>Status</th><th>Hex</th></tr>)";
+        <tr><th>Czas / Time</th><th>RSSI</th><th>Długość / Length</th><th>Status</th><th>Hex</th></tr>)";
       int showD = diagCount < MAX_DIAG ? diagCount : MAX_DIAG;
       for (int i = 0; i < showD; i++) {
         int idx = (diagHead - showD + i + MAX_DIAG) % MAX_DIAG;
@@ -2198,7 +2489,7 @@ void handleRoot() {
   html += String(MAX_SHOW_FRAMES);
   html += R"( )</h2>
   <table>
-    <tr><th>Czas</th><th>MHz</th><th>Profil</th><th>RSSI</th><th>Len</th><th>Hex</th></tr>)";
+    <tr><th>Czas / Time</th><th>MHz</th><th>Profil</th><th>RSSI</th><th>Len</th><th>Hex</th></tr>)";
 
   int show = frameCount < MAX_SHOW_FRAMES ? frameCount : MAX_SHOW_FRAMES;
   for (int i = 0; i < show; i++) {
@@ -2218,7 +2509,7 @@ void handleRoot() {
   </table>)";
   }  // koniec sekcji skanera surowego
 
-  html += R"(<p style="margin-top:12px; color:#6bcb77; font-size:0.9em;">Filtr ramek: )";
+  html += R"(<p style="margin-top:12px; color:#6bcb77; font-size:0.9em;">Filtr ramek / Frame filter: )";
   html += filterCfg.enabled ? "WŁĄCZONY" : "WYŁĄCZONY";
   if (filterCfg.enabled) {
     html += " — wzorzec: ";
@@ -2242,7 +2533,132 @@ void handleRoot() {
   </p>)";
   }
 
+  // --- Diagnostyka systemu / System diagnostics: zdarzenia, restarty, watchdog ---
+  html += R"(<h2>Diagnostyka systemu / System diagnostics</h2>
+  <div style="background:#16213e;padding:14px;border-radius:8px;margin-bottom:12px;color:#bbb;font-size:0.85em">
+    Powód restartu / Reset reason: <b style="color:)";
+  bool badReset = (bootResetReason == ESP_RST_BROWNOUT || bootResetReason == ESP_RST_PANIC ||
+                   bootResetReason == ESP_RST_TASK_WDT || bootResetReason == ESP_RST_INT_WDT ||
+                   bootResetReason == ESP_RST_WDT);
+  html += badReset ? "#ff6b6b" : "#6bcb77";
+  html += R"(" id="sys-reset">)";
+  html += String(resetReasonText(bootResetReason));
+  html += R"(</b> &nbsp;|&nbsp; Startów / Boots: <b id="sys-boots">)";
+  html += String(rtcBootCount);
+  html += R"(</b> &nbsp;|&nbsp; Watchdog: <b id="sys-wdt">)";
+  html += wdtEnabled ? "włączony (30 s)" : "WYŁĄCZONY";
+  html += R"(</b> &nbsp;|&nbsp; Restarty WDT / WDT resets: <b style="color:#ff6b6b">)";
+  html += String(rtcWdtResets);
+  html += R"(</b> &nbsp;|&nbsp; Brownout: <b style="color:#ffb84d">)";
+  html += String(rtcBrownouts);
+  html += R"(</b> &nbsp;|&nbsp; Crash: <b style="color:#ffb84d">)";
+  html += String(rtcPanics);
+  html += R"(</b><br>
+    Wolna RAM / Free RAM: <b id="sys-heap">)";
+  html += String(ESP.getFreeHeap());
+  html += R"(</b> B &nbsp;|&nbsp; Najdłuższe loop() / Max loop(): <b id="sys-maxloop">)";
+  html += String(statMaxLoopMs);
+  html += R"(</b> ms &nbsp;|&nbsp; Reinicjalizacje radia / Radio reinits: <b id="sys-reinit">)";
+  html += String(statRadioReinit);
+  html += R"(</b> &nbsp;|&nbsp; Restarty odbioru / RX restarts: <b id="sys-rxrestart">)";
+  html += String(statRxRestarts);
+  html += R"(</b> &nbsp;|&nbsp; Cykle / Cycles: <b id="sys-loops">)";
+  html += String(statLoopCount);
+  html += R"(</b>
+  </div>)";
+
+  html += R"(<table>
+    <tr><th>Czas / Time</th><th>Poziom / Level</th><th>Zdarzenie / Event</th></tr>)";
+  if (logCount == 0) {
+    html += R"(<tr><td colspan="3" style="color:#666">(brak zdarzeń)</td></tr>)";
+  } else {
+    int start = (logHead - logCount + MAX_LOG) % MAX_LOG;
+    for (int i = 0; i < logCount; i++) {
+      LogEntry& e = eventLog[(start + i) % MAX_LOG];
+      const char* col = (e.level == LOG_ERROR) ? "#ff6b6b" : (e.level == LOG_WARN ? "#ffb84d" : "#6bcb77");
+      const char* lvl = (e.level == LOG_ERROR) ? "BŁĄD" : (e.level == LOG_WARN ? "UWAGA" : "INFO");
+      html += "<tr><td class='mono'>" + String(e.t / 1000) + "s</td><td style='color:" + col + "'>" + lvl +
+              "</td><td>" + String(e.msg) + "</td></tr>";
+    }
+  }
+  html += R"(</table>
+  <p style="color:#666;font-size:0.85em">Pełny raport / Full report: <a href="/log" style="color:#00d9ff">/log</a>
+  &nbsp;|&nbsp; Plik błędów / Error file: <a href="/errors" style="color:#00d9ff">/errors</a>
+  &nbsp;|&nbsp; JSON: <a href="/status" style="color:#00d9ff">/status</a>
+  &nbsp;|&nbsp; Zdalny restart / Remote reboot: <a href="/reboot" style="color:#ffb84d">/reboot</a></p>)";
+
   html += R"(
+<script>
+// Odświeżanie wartości bez przeładowywania całej strony (nie "zawiesza" się
+// i nie miga jak <meta http-equiv="refresh">).
+function setText(id, text) {
+  var el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+function windDirText(deg) {
+  var dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+  return dirs[Math.round(((deg % 360) / 22.5)) % 16];
+}
+function refresh() {
+  fetch('/json')
+    .then(function(r) { return r.json(); })
+    .then(function(j) {
+      setText('stat-frames', j.totalFrames);
+      setText('stat-accepted', j.acceptedFrames);
+      setText('stat-rejected', j.rejectedFrames);
+      setText('stat-uptime', j.uptime + 's');
+      var rEl = document.getElementById('stat-radio');
+      if (rEl) {
+        rEl.textContent = j.radioOk ? 'OK' : 'BRAK';
+        rEl.style.color = j.radioOk ? '#6bcb77' : '#ff6b6b';
+      }
+      if (j.weather) {
+        var w = j.weather;
+        setText('w-model', w.model);
+        setText('w-id', w.id);
+        setText('w-battery', w.battery_ok ? 'OK' : 'SLABA');
+        if (w.temperature_C !== undefined) setText('w-temp', w.temperature_C + ' \u00B0C');
+        if (w.humidity !== undefined) setText('w-hum', w.humidity + ' %');
+        if (w.wind_avg_m_s !== undefined) setText('w-wind', Number(w.wind_avg_m_s).toFixed(1) + ' m/s (' + (w.wind_avg_m_s * 3.6).toFixed(1) + ' km/h)');
+        if (w.wind_max_m_s !== undefined) setText('w-gust', Number(w.wind_max_m_s).toFixed(1) + ' m/s (' + (w.wind_max_m_s * 3.6).toFixed(1) + ' km/h)');
+        if (w.wind_dir_deg !== undefined) setText('w-dir', w.wind_dir_deg + '\u00B0 (' + windDirText(w.wind_dir_deg) + ')');
+        if (w.rain_mm !== undefined) setText('w-rain', Number(w.rain_mm).toFixed(1) + ' mm');
+        if (w.uvi !== undefined) setText('w-uv', w.uvi);
+        if (w.light_lux !== undefined) {
+          var isYt = (w.model === 'Vevor-YT60309');
+          setText('w-light', isYt ? w.light_lux + ' W/m\u00B2' : w.light_lux + ' lux (' + (w.light_lux / 1000).toFixed(2) + ' k lux)');
+        }
+        setText('w-rssi', w.rssi + ' dBm');
+        setText('w-hex', w.hex);
+      }
+    })
+    .catch(function() { /* chwilowy brak połączenia - pomiń */ });
+}
+setInterval(refresh, 3000);
+
+// Statystyki systemu (restarty, watchdog, RAM) z /status.
+function refreshSys() {
+  fetch('/status')
+    .then(function(r) { return r.json(); })
+    .then(function(s) {
+      setText('sys-boots', s.bootCount);
+      setText('sys-reinit', s.radioReinits);
+      setText('sys-rxrestart', s.rxRestarts);
+      setText('sys-loops', s.loopCount);
+      var h = document.getElementById('sys-heap');
+      if (h) h.textContent = s.freeHeap + ' (min ' + s.heapMin + ')';
+      setText('sys-maxloop', s.maxLoopMs);
+      var w = document.getElementById('sys-wdt');
+      if (w) {
+        w.textContent = (s.watchdogEnabled ? 'włączony (30 s)' : 'WYŁĄCZONY') +
+                        ' | WDT: ' + s.wdtResets + ' | brownout: ' + s.brownouts +
+                        ' | crash: ' + s.panics;
+      }
+    })
+    .catch(function() {});
+}
+setInterval(refreshSys, 10000);
+</script>
 </body>
 </html>)";
 
@@ -2406,27 +2822,25 @@ void saveWifiCfg() {
 }
 
 void applyWifi() {
-  // AP tylko wtedy, gdy NIE mamy skonfigurowanego STA. Beacony AP nadawane
-  // non-stop zagłuszają odbiornik 868 MHz - po połączeniu z domowym WiFi
-  // wyłączamy AP, żeby CC1101 miał ciszę.
-  if (wifiCfg.staSsid.length() == 0) {
-    WiFi.mode(WIFI_AP);
-  } else {
-    WiFi.mode(WIFI_STA);
-  }
+  // AP ZAWSZE włączony + równoległe połączenie z siecią domową (STA).
+  // Dzięki temu urządzenie jest ZAWSZE osiągalne pod 192.168.4.1 (AP), nawet
+  // gdy sieć domowa nie odpowiada. Nie wyłączamy AP przy połączonym STA -
+  // to odcinało dostęp do urządzenia.
+  WiFi.mode(WIFI_AP_STA);
 
   // Obniż moc nadawczą WiFi (po ustawieniu trybu!). Pełna moc ESP32 (~20 dBm)
   // wstrzykuje krótkie skoki szumu do CC1101 i maskuje słabsze sygnały stacji.
-  // Router jest kilka metrów dalej - 2 dBm w zupełności wystarczy, a radio
-  // przestaje być głuszone. Na WROOM antena WiFi jest bliżej CC1101 niż na S3.
-  WiFi.setTxPower(WIFI_POWER_2dBm);
+  // 8.5 dBm to ~50% mocy - wystarczające na kilkanaście metrów do routera,
+  // a znacząco mniejsze zakłócenia dla odbiornika 868 MHz.
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+
+  if (wifiCfg.apPass.length() >= 8) {
+    WiFi.softAP(wifiCfg.apSsid.c_str(), wifiCfg.apPass.c_str());
+  } else {
+    WiFi.softAP(wifiCfg.apSsid.c_str());  // AP otwarty (hasło za krótkie)
+  }
 
   if (wifiCfg.staSsid.length() == 0) {
-    if (wifiCfg.apPass.length() >= 8) {
-      WiFi.softAP(wifiCfg.apSsid.c_str(), wifiCfg.apPass.c_str());
-    } else {
-      WiFi.softAP(wifiCfg.apSsid.c_str());  // AP otwarty (hasło za krótkie)
-    }
     Serial.println("Brak skonfigurowanego SSID STA - praca tylko w trybie AP.");
     return;
   }
@@ -2498,7 +2912,7 @@ void handleSetup() {
   </style>
 </head>
 <body>
-  <h1>Konfiguracja sieci</h1>
+  <h1>Konfiguracja / Configuration</h1>
   <div style="margin-bottom:14px">
     <a href="/">📡 Odczyt</a>
     <a href="/setup">⚙️ Ustawienia</a>
@@ -2510,23 +2924,23 @@ void handleSetup() {
   </div>
   <form method="post" action="/save">
     <div class="card">
-      <h2>Punkt dostepowy (AP) - zawsze aktywny</h2>
-      <label>Nazwa sieci AP (SSID)</label>
+      <h2>Punkt dostepowy AP / Access point (AP) - zawsze aktywny / always on</h2>
+      <label>Nazwa sieci AP / AP SSID</label>
       <input type="text" name="apSsid" value=")";
   h += htmlEscape(wifiCfg.apSsid);
   h += R"(">
-      <label>Haslo AP (min. 8 znakow)</label>
+      <label>Haslo AP / AP password (min. 8 znakow / chars)</label>
       <input type="text" name="apPass" value=")";
   h += htmlEscape(wifiCfg.apPass);
   h += R"(">
     </div>
     <div class="card">
-      <h2>Sieć kliencka (STA)</h2>
-      <label>SSID sieci Wi-Fi</label>
+      <h2>Sieć kliencka / Client network (STA)</h2>
+      <label>SSID sieci Wi-Fi / Wi-Fi SSID</label>
       <input type="text" name="ssid" value=")";
   h += htmlEscape(wifiCfg.staSsid);
   h += R"(">
-      <label>Haslo sieci Wi-Fi</label>
+      <label>Haslo sieci Wi-Fi / Wi-Fi password</label>
       <input type="password" name="pass" value=")";
   h += htmlEscape(wifiCfg.staPass);
   h += R"(">
@@ -2537,13 +2951,13 @@ void handleSetup() {
         <label for="staticip">Uzyj stalego adresu IP</label>
       </div>
       <div class="grid">
-        <div><label>Adres IP</label><input type="text" name="ip" value=")";
+        <div><label>Adres IP / IP address</label><input type="text" name="ip" value=")";
   h += htmlEscape(wifiCfg.ip);
   h += R"("></div>
-        <div><label>Maska</label><input type="text" name="mask" value=")";
+        <div><label>Maska / Netmask</label><input type="text" name="mask" value=")";
   h += htmlEscape(wifiCfg.mask);
   h += R"("></div>
-        <div><label>Brama</label><input type="text" name="gw" value=")";
+        <div><label>Brama / Gateway</label><input type="text" name="gw" value=")";
   h += htmlEscape(wifiCfg.gw);
   h += R"("></div>
         <div><label>DNS</label><input type="text" name="dns" value=")";
@@ -2553,8 +2967,8 @@ void handleSetup() {
       <div class="hint">Staly adres IP dziala tylko w sieci klienckiej (STA). Gdy opcja jest odznaczona, uzywane jest DHCP.</div>
     </div>
     <div class="card">
-      <h2>Tryb odbioru</h2>
-      <label>Tryb pracy radia</label>
+      <h2>Tryb odbioru / RX mode</h2>
+      <label>Tryb pracy radia / Radio mode</label>
       <select name="rxMode" style="width:100%;max-width:420px;padding:8px;border-radius:6px;border:1px solid #0f3460;background:#0f1b3d;color:#eee;font-size:0.95em">
         <option value="raw" )";
   h += (rxMode == MODE_RAW_SCAN) ? "selected" : "";
@@ -2578,32 +2992,32 @@ void handleSetup() {
       <div class="hint">„AUTO” po kolei próbuje wszystkich protokołów stacji pogodowych (po 20 s każdy) — zalecane na start, pokaże który protokół pasuje. „VEVOR / Youtong 7-in-1” nasluchuje 868.30 MHz (sync CA 54, protokół 263) — to pasuje do Twojej stacji. „VEVOR YT60309” nasluchuje 868.35 MHz (sync C0AA C0AA). „Fine Offset / WH65” nasluchuje 868.30 MHz. „Bresser” nasluchuje 868.30 MHz (FSK ~8.2 kbaud). „Skan raw” przeszukuje czestotliwosci i profile.</div>
     </div>
     <div class="card">
-      <h2>Filtr ramek (ID urzadzenia)</h2>
+      <h2>Filtr ramek / Frame filter (ID urzadzenia / device ID)</h2>
       <div class="row">
         <input type="checkbox" name="filtEn" id="filtEn" )";
   h += filterCfg.enabled ? "checked" : "";
   h += R"(>
         <label for="filtEn">Wlacz filtr (zapisuj tylko pasujace ramki)</label>
       </div>
-      <label>Wzorzec hex (np. ID urzadzenia)</label>
+      <label>Wzorzec hex / Hex pattern (np. ID urzadzenia / e.g. device ID)</label>
       <input type="text" name="filtPat" value=")";
   h += htmlEscape(filterCfg.pattern);
   h += R"(">
       <div class="hint">Pusty wzorzec = filtruj tylko po dlugosci ramki. Hex, spacje myslniki dozwolone.</div>
       <div class="grid">
-        <div><label>Offset (bajt startu)</label><input type="number" name="filtOff" value=")";
+        <div><label>Offset (bajt startu / start byte)</label><input type="number" name="filtOff" value=")";
   h += String(filterCfg.offset);
   h += R"("></div>
-        <div><label>Min. dlugosc</label><input type="number" name="filtMin" value=")";
+        <div><label>Min. dlugosc / Min length</label><input type="number" name="filtMin" value=")";
   h += String(filterCfg.minLen);
   h += R"("></div>
-        <div><label>Max. dlugosc (0=bez)</label><input type="number" name="filtMax" value=")";
+        <div><label>Max. dlugosc / Max length (0=bez / none)</label><input type="number" name="filtMax" value=")";
   h += String(filterCfg.maxLen);
   h += R"("></div>
       </div>
       <div class="hint">Offset -1 = szukaj wzorca w calej ramce. Offset >= 0 = wzorzec musi byc dokladnie na tym bajcie (liczac od 0).</div>
     </div>
-    <button type="submit">Zapisz i zastosuj</button>
+    <button type="submit">Zapisz i zastosuj / Save and apply</button>
   </form>
   <p style="margin-top:14px; color:#666; font-size:0.85em">
     Po zapisaniu urzadzenie przełączy sieć. Punkt dostepowy dziala zawsze - domyslnie pod adresem 192.168.4.1.
@@ -2633,7 +3047,7 @@ void handleSave() {
   filterCfg.maxLen = server.hasArg("filtMax") ? server.arg("filtMax").toInt() : 0;
   saveFilterCfg();
 
-  // Tryb odbioru
+  // Tryb odbioru / RX mode
   RxMode newMode = MODE_RAW_SCAN;
   if (server.arg("rxMode") == "fo") newMode = MODE_FINE_OFFSET;
   else if (server.arg("rxMode") == "vevor") newMode = MODE_VEVOR_7IN1;
@@ -2754,53 +3168,53 @@ String cfgPageEnd() {
 }
 
 void handleCal() {
-  String h = cfgPageStart("Kalibracja - Weather Sniffer", "📐 Kalibracja czujników");
+  String h = cfgPageStart("Kalibracja / Calibration - Weather Sniffer", "📐 Kalibracja czujników / Sensor calibration");
   h += R"(<form method="post" action="/savecal">
     <div class="card">
-      <h2>Korekta wskazań (stosowana po dekodowaniu)</h2>
+      <h2>Korekta wskazan / Readings correction (po dekodowaniu / after decoding)</h2>
       <div class="hint">Wzór: y = x · factor + offset. Factor 1.0 i offset 0 = bez zmian.</div>
       <div class="grid">
         <div><label>Temp. offset [°C]</label><input type="number" step="0.1" name="tempOffset" value=")";
   h += String(calCfg.tempOffset, 1);
   h += R"("></div>
-        <div><label>Wilgotność offset [%]</label><input type="number" step="0.1" name="humOffset" value=")";
+        <div><label>Wilgotnosc offset / Humidity offset [%]</label><input type="number" step="0.1" name="humOffset" value=")";
   h += String(calCfg.humOffset, 1);
   h += R"("></div>
-        <div><label>Wiatr × factor</label><input type="number" step="0.01" name="windFactor" value=")";
+        <div><label>Wiatr x factor / Wind x factor</label><input type="number" step="0.01" name="windFactor" value=")";
   h += String(calCfg.windFactor, 3);
   h += R"("></div>
-        <div><label>Porywy × factor</label><input type="number" step="0.01" name="gustFactor" value=")";
+        <div><label>Porywy x factor / Gust x factor</label><input type="number" step="0.01" name="gustFactor" value=")";
   h += String(calCfg.gustFactor, 3);
   h += R"("></div>
-        <div><label>Deszcz × factor</label><input type="number" step="0.01" name="rainFactor" value=")";
+        <div><label>Deszcz x factor / Rain x factor</label><input type="number" step="0.01" name="rainFactor" value=")";
   h += String(calCfg.rainFactor, 3);
   h += R"("></div>
-        <div><label>Światło × factor</label><input type="number" step="0.01" name="lightFactor" value=")";
+        <div><label>Swiatlo x factor / Light x factor</label><input type="number" step="0.01" name="lightFactor" value=")";
   h += String(calCfg.lightFactor, 3);
   h += R"("></div>
-        <div><label>Kierunek wiatru offset [°]</label><input type="number" name="windDirOffset" value=")";
+        <div><label>Kierunek wiatru / Wind direction offset [°]</label><input type="number" name="windDirOffset" value=")";
   h += String(calCfg.windDirOffset);
   h += R"("></div>
       </div>
     </div>
-    <button type="submit">Zapisz kalibrację</button>
+    <button type="submit">Zapisz kalibracje / Save calibration</button>
   </form>)";
   h += cfgPageEnd();
   server.send(200, "text/html", h);
 }
 
 void handleSend() {
-  String h = cfgPageStart("Wysyłanie - Weather Sniffer", "📤 Wysyłanie danych");
+  String h = cfgPageStart("Wysylanie / Sending - Weather Sniffer", "📤 Wysylanie danych / Data sending");
   h += R"(<form method="post" action="/savesend">
     <div class="card">
-      <h2>HTTP (POST JSON do innego urządzenia)</h2>
+      <h2>HTTP (POST JSON do innego urzadzenia / to another device)</h2>
       <div class="row">
         <input type="checkbox" name="wifiEnabled" id="wifiEnabled" )";
   h += sendCfg.wifiEnabled ? "checked" : "";
   h += R"(>
         <label for="wifiEnabled">Włącz wysyłkę HTTP po każdym odbiorze</label>
       </div>
-      <label>Adres URL odbiorcy</label>
+      <label>Adres URL odbiorcy / Receiver URL</label>
       <input type="text" name="targetUrl" value=")";
   h += htmlEscape(sendCfg.targetUrl);
   h += R"(">
@@ -2824,15 +3238,15 @@ void handleSend() {
         <div><label>Baud</label><input type="number" name="rs485Baud" value=")";
   h += String(sendCfg.rs485Baud);
   h += R"("></div>
-        <div><label>DE/RE pin (-1 = brak)</label><input type="number" name="rs485DePin" value=")";
+        <div><label>DE/RE pin (-1 = brak / none)</label><input type="number" name="rs485DePin" value=")";
   h += String(sendCfg.rs485DePin);
   h += R"("></div>
       </div>
     </div>
-    <button type="submit">Zapisz wysyłanie</button>
+    <button type="submit">Zapisz wysylanie / Save sending</button>
   </form>
   <form method="post" action="/sendtest" style="margin-top:8px">
-    <button type="submit">Wyślij testowy pakiet (ostatnie dane)</button>
+    <button type="submit">Wyslij testowy pakiet / Send test packet</button>
   </form>)";
   h += cfgPageEnd();
   server.send(200, "text/html", h);
@@ -2849,7 +3263,7 @@ void handleMqtt() {
   h += R"(>
         <label for="enabled">Włącz MQTT</label>
       </div>
-      <label>Adres brokera</label>
+      <label>Adres brokera / Broker address</label>
       <input type="text" name="broker" value=")";
   h += htmlEscape(mqttCfg.broker);
   h += R"(">
@@ -2857,15 +3271,15 @@ void handleMqtt() {
       <input type="number" name="port" value=")";
   h += String(mqttCfg.port);
   h += R"(">
-      <label>Użytkownik (opcjonalnie)</label>
+      <label>Uzytkownik / User (opcjonalnie / optional)</label>
       <input type="text" name="user" value=")";
   h += htmlEscape(mqttCfg.user);
   h += R"(">
-      <label>Hasło (opcjonalnie)</label>
+      <label>Haslo / Password (opcjonalnie / optional)</label>
       <input type="password" name="pass" value=")";
   h += htmlEscape(mqttCfg.pass);
   h += R"(">
-      <label>Prefiks tematu</label>
+      <label>Prefiks tematu / Topic prefix</label>
       <input type="text" name="topicPrefix" value=")";
   h += htmlEscape(mqttCfg.topicPrefix);
   h += R"(">
@@ -2876,7 +3290,7 @@ void handleMqtt() {
         <label for="haDiscovery">Publikuj auto-odkrycie Home Assistant</label>
       </div>
     </div>
-    <button type="submit">Zapisz MQTT</button>
+    <button type="submit">Zapisz MQTT / Save MQTT</button>
   </form>)";
   h += cfgPageEnd();
   server.send(200, "text/html", h);
@@ -2893,7 +3307,7 @@ void handleSaveCal() {
   saveCalCfg();
   if (lastWeatherValid) lastWeatherCal = calibrateWeather(lastWeather);
 
-  String msg = cfgPageStart("Zapisano", "✅ Kalibracja zapisana");
+  String msg = cfgPageStart("Zapisano / Saved", "✅ Kalibracja zapisana / Calibration saved");
   msg += R"(<div class="msg">Zapisano. <a href="/cal">Wróć do kalibracji</a> · <a href="/">Odczyt</a></div>)";
   msg += cfgPageEnd();
   server.send(200, "text/html", msg);
@@ -2910,7 +3324,7 @@ void handleSaveSend() {
   saveSendCfg();
   applySend();
 
-  String msg = cfgPageStart("Zapisano", "✅ Wysyłanie zapisane");
+  String msg = cfgPageStart("Zapisano / Saved", "✅ Wysylanie zapisane / Sending saved");
   msg += R"(<div class="msg">Zapisano. <a href="/send">Wróć do wysyłania</a> · <a href="/">Odczyt</a></div>)";
   msg += cfgPageEnd();
   server.send(200, "text/html", msg);
@@ -2927,14 +3341,14 @@ void handleSaveMqtt() {
   saveMqttCfg();
   applyMqtt();
 
-  String msg = cfgPageStart("Zapisano", "✅ MQTT zapisane");
+  String msg = cfgPageStart("Zapisano / Saved", "✅ MQTT zapisane / MQTT saved");
   msg += R"(<div class="msg">Zapisano. <a href="/mqtt">Wróć do MQTT</a> · <a href="/">Odczyt</a></div>)";
   msg += cfgPageEnd();
   server.send(200, "text/html", msg);
 }
 
 void handleSendTest() {
-  String msg = cfgPageStart("Test wysyłki", "📤 Test wysyłki");
+  String msg = cfgPageStart("Test wysylki / Send test", "📤 Test wysylki / Send test");
   if (!lastWeatherValid) {
     msg += R"(<div class="msg" style="color:#ffb84d">Brak danych pogodowych do wysłania.
       Poczekaj na odebranie ramki (stacja nadaje co ~16–20 s), potem spróbuj ponownie.</div>)";
@@ -3022,6 +3436,7 @@ String burstScan(float mhz, int secs, bool wide, int agc) {
 
   unsigned long endUs = micros() + (unsigned long)secs * 1000000UL;
   while (true) {
+    wdtFeed();   // dluga operacja - nie pozwol watchdogowi zrestartowac
     int r = calculateRSSI(ccStatusRead(0x34));
     samples++;
     if (r > maxR) maxR = r;
@@ -3188,6 +3603,7 @@ String sniffRun(float mhz, float kbaud, bool ook, int agc, int secs) {
   int found = 0;
   long guard = 0;
   while (found < 3 && micros() < tEnd) {
+    wdtFeed();   // dluga operacja - nie pozwol watchdogowi zrestartowac
     int r = calculateRSSI(ccStatusRead(0x34));
     // Bez ciaglego oprozniania FIFO radio wchodzi w RXFIFO_OVERFLOW i RSSI
     // zamarza - wtedy zaden burst nie zostanie wykryty.
@@ -3473,12 +3889,12 @@ void handleSpiTest() {
 // `firmware.factory.bin` (ten zawiera bootloader + tablicę partycji).
 void handleOtaForm() {
   String h = "<html><meta charset='utf-8'><body style='font-family:sans-serif'>"
-             "<h2>Aktualizacja firmware (OTA)</h2>"
-             "<p>Wybierz plik <b>firmware.bin</b> (sama aplikacja, ~1,2 MB). "
-             "NIE używaj pliku factory.bin.</p>"
+             "<h2>Aktualizacja firmware / Firmware update (OTA)</h2>"
+             "<p>Wybierz plik / Choose file <b>firmware.bin</b> (sama aplikacja / application only, ~1,2 MB). "
+             "NIE uzywaj pliku factory.bin / Do NOT use factory.bin.</p>"
              "<form method='POST' action='/update' enctype='multipart/form-data'>"
              "<input type='file' name='fw' accept='.bin'> "
-             "<input type='submit' value='Wgraj i zrestartuj'>"
+             "<input type='submit' value='Wgraj i zrestartuj / Upload and restart'>"
              "</form></body></html>";
   server.send(200, "text/html; charset=utf-8", h);
 }
@@ -3497,6 +3913,10 @@ void handleOtaUpload() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
     Serial.printf("OTA: start %s (%u B)\n", upload.filename.c_str(), upload.totalSize);
+    // Podczas uploadu podnieś moc WiFi do maksimum - przy 2 dBm duży transfer
+    // ginie w połowie (słabe połączenie). Odbiornik i tak nie nasłuchuje
+    // w trakcie aktualizacji, więc zagłuszanie radia nie ma znaczenia.
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Update.printError(Serial);
     }
@@ -3510,7 +3930,393 @@ void handleOtaUpload() {
     } else {
       Update.printError(Serial);
     }
+    // Przywróć normalną (umiarkowaną) moc - nie zagłuszać radia po restarcie.
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
   }
+}
+
+// ==================== ZDALNA DIAGNOSTYKA (log / status / restart) ====================
+// /log     - log zdarzeń + stan systemu (widok konsoli, PL/EN)
+// /log?raw=1     - to samo jako czysty tekst (do skryptów)
+// /status  - stan w JSON
+// /errors  - plik błędów (widok konsoli, PL/EN), /errors?raw=1 = tekst
+// /reboot  - zdalny restart
+
+// Wspólny szablon strony diagnostycznej: ciemny "konsolowy" wygląd + nawigacja.
+String diagPageStart(const String& title, const String& subPl, const String& subEn, bool autoRefresh) {
+  String h;
+  h.reserve(1400);
+  h += "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+       "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+       "<title>" + title + "</title><style>"
+       "body{font-family:Consolas,Menlo,'DejaVu Sans Mono',monospace;background:#0d1117;color:#c9d1d9;"
+       "margin:0;padding:14px;font-size:14px}"
+       "h1{color:#58a6ff;font-size:1.15em;margin:0 0 2px 0}"
+       ".sub{color:#8b949e;font-size:0.85em;margin-bottom:3px}"
+       ".alt{color:#6e7681;font-size:0.8em;margin-bottom:10px}"
+       "a{color:#58a6ff;text-decoration:none;margin-right:12px;white-space:nowrap}"
+       "a:hover{text-decoration:underline}"
+       ".nav{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:9px;margin-bottom:10px;"
+       "line-height:1.9}"
+       ".card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;margin-bottom:10px}"
+       "pre{background:#010409;border:1px solid #30363d;border-radius:6px;padding:12px;"
+       "font-size:0.82em;line-height:1.5;overflow-x:auto;white-space:pre-wrap;word-break:break-word;margin:0}"
+       ".ok{color:#3fb950}.warn{color:#d29922}.err{color:#f85149}.dim{color:#8b949e}"
+       ".lbl{color:#8b949e}.val{color:#c9d1d9;font-weight:bold}"
+       "button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;"
+       "padding:5px 12px;font-family:inherit;font-size:0.9em;cursor:pointer}"
+       "button:hover{background:#30363d}"
+       "</style></head><body>";
+  h += "<h1>" + title + "</h1>";
+  h += "<div class='sub'>" + subPl + "</div>";
+  h += "<div class='alt'>" + subEn + "</div>";
+  h += "<div class='nav'>"
+       "<a href='/'>📡 Odczyt / Main</a>"
+       "<a href='/log'>📋 Log</a>"
+       "<a href='/errors'>🚨 Błędy / Errors</a>"
+       "<a href='/status'>🩺 Status JSON</a>"
+       "<a href='/update'>⬆️ OTA</a>"
+       "<a href='/log?raw=1'>⌨️ Log (tekst)</a>"
+       "<a href='/reboot'>♻️ Restart</a>"
+       "</div>";
+  return h;
+}
+
+String buildDiagReport() {
+  bool pl = true;   // etykiety PL; poniżej wersje EN w nawiasach
+  String s;
+  s.reserve(2600);
+  s += "==================== STAN URZADZENIA / DEVICE STATUS ====================\n";
+  s += "Uptime (czas pracy)          : " + String((millis() - startTime) / 1000) + " s\n";
+  s += "Powod restartu / Reset reason: " + String(resetReasonText(bootResetReason)) + "\n";
+  s += "Liczba startow / Boot count  : " + String(rtcBootCount) + "\n";
+  s += "Restarty watchdog / WDT reset: " + String(rtcWdtResets) + "\n";
+  s += "Brownout (zasilanie)         : " + String(rtcBrownouts) + "\n";
+  s += "Crash (panic)                : " + String(rtcPanics) + "\n";
+  s += "Tryb odbioru / RX mode       : " + String(rxMode == MODE_VEVOR_7IN1 ? "VEVOR 7-in-1" :
+                                                rxMode == MODE_VEVOR_YT60309 ? "VEVOR YT60309" :
+                                                rxMode == MODE_FINE_OFFSET ? "Fine Offset" :
+                                                rxMode == MODE_BRESSER ? "Bresser" :
+                                                rxMode == MODE_WEATHER_AUTO ? "AUTO" : "Skan raw") + "\n";
+  s += "\n==================== RADIO / SPI ====================\n";
+  s += "CC1101 VERSION         : 0x" + String(ccStatusRead(0x31), HEX) +
+       (ccStatusRead(0x31) == 0x14 ? "  [OK]" : "  [BLAD / ERROR]") + "\n";
+  s += "MARCSTATE              : 0x" + String(ccStatusRead(0x35) & 0x1F, HEX) +
+       ((ccStatusRead(0x35) & 0x1F) == 0x0D ? "  [RX OK - odbior / receiving]" : "  [NIE RX - NOT RX]") + "\n";
+  s += "RSSI teraz / now       : " + String(calculateRSSI(ccStatusRead(0x34))) + " dBm\n";
+  s += "Predkosc SPI / SPI clk : " + String(gSpiHz / 1000) + " kHz\n";
+  s += "RXBYTES (bufor)        : " + String(ccStatusRead(0x3B) & 0x7F) + "\n";
+  s += "Reinicjalizacje radia  : " + String(statRadioReinit) + "\n";
+  s += "Restarty odbioru       : " + String(statRxRestarts) + "\n";
+  s += "Obnizenia SPI          : " + String(statSpiFallback) + "\n";
+  s += "\n============= ODBIOR STACJI / WEATHER STATION =============\n";
+  s += "Ramki (sync OK)        : " + String(diagTotal) + "\n";
+  s += "Zdekodowane / decoded  : " + String(acceptedFrames) + "\n";
+  s += "Odrzucone / rejected   : " + String(rejectedFrames) + "\n";
+  if (lastWeatherValid) {
+    s += "Ostatnie dane / last   : T=" + String(lastWeatherCal.tempC, 1) + "C RH=" +
+         String(lastWeatherCal.humidity) + "% " +
+         String(lastWeatherCal.windAvgMs, 1) + "m/s dir=" + String(lastWeatherCal.windDirDeg) + "deg\n";
+    s += "Czas od pakietu / age  : " + String((millis() - lastWeather.t) / 1000) + " s\n";
+  } else {
+    s += "Ostatnie dane / last   : brak / none\n";
+  }
+  s += "\n==================== SYSTEM ====================\n";
+  s += "Watchdog               : " + String(wdtEnabled ? ("wlaczony / ON (" + String(WDT_TIMEOUT_S) + " s)") : "WYLACZONY / OFF") + "\n";
+  s += "Wolna pamiec / free RAM: " + String(ESP.getFreeHeap()) + " B (min " + String(statHeapMin) + " B)\n";
+  s += "Najdluzsze loop()      : " + String(statMaxLoopMs) + " ms (poprzednia sesja " + String(rtcLastMaxLoopMs) + " ms)\n";
+  s += "Cykle loop() / cycles  : " + String(statLoopCount) + "\n";
+  s += "WiFi STA               : " + String(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("brak / none")) +
+       "  (reconnect: " + String(statWifiRecon) + ")\n";
+  s += "WiFi AP                : " + WiFi.softAPIP().toString() + "\n";
+  s += "Sygnal WiFi / signal   : " + String(WiFi.RSSI()) + " dBm\n";
+  s += "Czas NTP / NTP time    : " + String(ntpSynced ? "OK" : "brak / not synced") + "\n";
+  s += "Plik bledow / err file : " + String(fsReady ? (String(ERR_FILE) + " (" + String(errFileLines) + " wpisow)") : "niedostepny / unavailable") + "\n";
+  s += "\n========== LOG ZDARZEN / EVENT LOG (najstarsze -> najnowsze) ==========\n";
+  if (logCount == 0) {
+    s += "(brak zdarzen / no events)\n";
+  } else {
+    int start = (logHead - logCount + MAX_LOG) % MAX_LOG;
+    for (int i = 0; i < logCount; i++) {
+      LogEntry& e = eventLog[(start + i) % MAX_LOG];
+      s += String(e.t / 1000) + "s [" +
+           (e.level == LOG_ERROR ? "BLAD " : (e.level == LOG_WARN ? "UWAGA" : "INFO ")) +
+           "] " + String(e.msg) + "\n";
+    }
+  }
+  return s;
+}
+
+// Widok logu jako strona-konsola (PL/EN), z odświeżaniem.
+void handleErrorsRaw();   // zdefiniowana niżej (używana przez handleErrorsPage)
+
+void handleLog() {
+  if (server.hasArg("raw")) {
+    server.send(200, "text/plain; charset=utf-8", buildDiagReport());
+    return;
+  }
+  String h = diagPageStart("📋 Log systemowy / System log",
+                           "Log zdarzeń, stan radia i systemu. Odświeża się sam co 5 s (bez przeładowania).",
+                           "Event log, radio and system status. Auto-refreshes every 5 s (no page reload).",
+                           true);
+  h += "<div class='card'>"
+       "<span class='lbl'>Odświeżanie / Refresh:</span> "
+       "<button onclick=\"tog()\" id='btn'>⏸ Pauza / Pause</button> "
+       "<span class='dim' id='tick'>—</span></div>";
+  h += "<pre id='log'>";
+  h += buildDiagReport();
+  h += "</pre>";
+  h += "<script>"
+       "var on=true;"
+       "function tog(){on=!on;document.getElementById('btn').innerHTML=on?'⏸ Pauza / Pause':'▶ Wznów / Resume';}"
+       "function load(){"
+       "  if(!on)return;"
+       "  fetch('/log?raw=1').then(function(r){return r.text();}).then(function(t){"
+       "    document.getElementById('log').textContent=t;"
+       "    document.getElementById('tick').textContent='aktualizacja / updated: '+new Date().toLocaleTimeString();"
+       "  }).catch(function(){});"
+       "}"
+       "setInterval(load,5000);"
+       "</script>";
+  h += "</body></html>";
+  server.send(200, "text/html; charset=utf-8", h);
+}
+
+// Widok pliku błędów jako strona-konsola (PL/EN), z przyciskiem kasowania.
+void handleErrorsPage() {
+  if (server.hasArg("raw")) {
+    handleErrorsRaw();
+    return;
+  }
+  String body;
+  body.reserve(4096);
+  size_t fileSize = 0;
+  if (fsReady) {
+    File f = LittleFS.open(ERR_FILE, "r");
+    if (f) {
+      fileSize = f.size();
+      errFileLines = 0;
+      while (f.available() && body.length() < 9000) {
+        String ln = f.readStringUntil('\n');
+        if (ln.length() > 0) errFileLines++;
+        body += ln;
+        body += '\n';
+      }
+      f.close();
+    } else {
+      errFileLines = 0;
+    }
+  }
+
+  String h = diagPageStart("🚨 Plik błędów / Error log file",
+                           "Do pliku trafiają TYLKO błędy. Zwykłe zdarzenia są w /log (pamięć RAM).",
+                           "ONLY errors are written to the file. Regular events live in /log (RAM).",
+                           false);
+  h += "<div class='card'>";
+  h += "<span class='lbl'>Zapis / File write:</span> <span class='" +
+       String(fsReady ? "ok'>OK" : "err'>NIEDOSTĘPNY / UNAVAILABLE") + "</span><br>";
+  if (fsReady) {
+    h += "<span class='lbl'>Miejsce / Space:</span> <span class='val'>" + String(LittleFS.usedBytes()) +
+         " / " + String(LittleFS.totalBytes()) + " B</span><br>";
+    h += "<span class='lbl'>Rozmiar pliku / File size:</span> <span class='val'>" + String(fileSize) +
+         " B</span> <span class='dim'>(limit rotacji / rotation limit: " + String(ERR_MAX_BYTES) + " B)</span><br>";
+    h += "<span class='lbl'>Wpisów / Entries:</span> <span class='val'>" + String(errFileLines) + "</span><br>";
+  }
+  h += "<span class='lbl'>Retencja / Retention:</span> <span class='val'>" + String(ERR_KEEP_DAYS) +
+       " dni / days</span> <span class='dim'>(starsze kasowane automatycznie / older deleted automatically)</span><br>";
+  h += "<span class='lbl'>Czas NTP / NTP time:</span> <span class='" +
+       String(ntpSynced ? "ok'>OK" : "warn'>brak / missing") + "</span>";
+  if (!ntpSynced) h += " <span class='dim'>(wpisy bez daty / entries without date)</span>";
+  h += "<br><span class='lbl'>Prędkość SPI / SPI clk:</span> <span class='val'>" + String(gSpiHz / 1000) + " kHz</span>";
+  h += "</div>";
+  h += "<div class='card'>"
+       "<button onclick=\"if(confirm('Skasować plik błędów? / Clear error log?'))location='/errors?clear=1'\">"
+       "🗑 Skasuj plik / Clear file</button> "
+       "<button onclick=\"location='/errtest'\">🧪 Testowy błąd / Test error</button> "
+       "<a href='/errors?raw=1'>⌨️ Tekst / Raw</a>"
+       "</div>";
+  h += "<pre>";
+  if (!fsReady) {
+    h += "LittleFS niedostępny - zapis błędów wyłączony.\nLittleFS unavailable - error logging disabled.\n";
+  } else if (body.length() == 0) {
+    h += "(plik pusty - brak błędów)\n(empty file - no errors)\n";
+  } else {
+    h += body;
+  }
+  h += "</pre></body></html>";
+  server.send(200, "text/html; charset=utf-8", h);
+}
+
+// /status - stan w JSON (do skryptów / HA)
+
+void handleStatus() {
+  String j = "{";
+  j += "\"uptime\":" + String((millis() - startTime) / 1000) + ",";
+  j += "\"resetReason\":\"" + String(resetReasonText(bootResetReason)) + "\",";
+  j += "\"bootCount\":" + String(rtcBootCount) + ",";
+  j += "\"wdtResets\":" + String(rtcWdtResets) + ",";
+  j += "\"brownouts\":" + String(rtcBrownouts) + ",";
+  j += "\"panics\":" + String(rtcPanics) + ",";
+  j += "\"hangResets\":" + String(rtcHangResets) + ",";
+  j += "\"watchdogEnabled\":" + String(wdtEnabled ? "true" : "false") + ",";
+  j += "\"radioVersion\":" + String(ccStatusRead(0x31)) + ",";
+  j += "\"radioOk\":" + String(ccStatusRead(0x31) == 0x14 ? "true" : "false") + ",";
+  j += "\"marcState\":" + String(ccStatusRead(0x35) & 0x1F) + ",";
+  j += "\"rssi\":" + String(calculateRSSI(ccStatusRead(0x34))) + ",";
+  j += "\"spiKhz\":" + String(gSpiHz / 1000) + ",";
+  j += "\"radioReinits\":" + String(statRadioReinit) + ",";
+  j += "\"rxRestarts\":" + String(statRxRestarts) + ",";
+  j += "\"frames\":" + String(diagTotal) + ",";
+  j += "\"accepted\":" + String(acceptedFrames) + ",";
+  j += "\"rejected\":" + String(rejectedFrames) + ",";
+  j += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+  j += "\"heapMin\":" + String(statHeapMin) + ",";
+  j += "\"maxLoopMs\":" + String(statMaxLoopMs) + ",";
+  j += "\"loopCount\":" + String(statLoopCount) + ",";
+  j += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  j += "\"wifiIp\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("")) + "\",";
+  j += "\"wifiApIp\":\"" + WiFi.softAPIP().toString() + "\",";
+  j += "\"wifiRssi\":" + String(WiFi.RSSI()) + ",";
+  if (lastWeatherValid) {
+    j += "\"lastDataAgeSec\":" + String((millis() - lastWeather.t) / 1000) + ",";
+  } else {
+    j += "\"lastDataAgeSec\":-1,";
+  }
+  j += "\"log\":[";
+  int start = (logCount > 0) ? (logHead - logCount + MAX_LOG) % MAX_LOG : 0;
+  for (int i = 0; i < logCount; i++) {
+    LogEntry& e = eventLog[(start + i) % MAX_LOG];
+    if (i) j += ",";
+    j += "{\"t\":" + String(e.t / 1000) + ",\"level\":" + String(e.level) + ",\"msg\":\"" + String(e.msg) + "\"}";
+  }
+  j += "]}";
+  server.send(200, "application/json", j);
+}
+
+void handleReboot() {
+  logEventS(LOG_WARN, "Zdalny restart na zadanie");
+  server.send(200, "text/plain; charset=utf-8", "Restartowanie...");
+  delay(300);
+  ESP.restart();
+}
+
+// /errors         - podgląd pliku błędów (tekst)
+// /errors?clear=1 - skasuj plik błędów
+void handleErrorsRaw() {
+  if (server.hasArg("clear")) {
+    if (fsReady && LittleFS.remove(ERR_FILE)) {
+      errFileLines = 0;
+      logEvent(LOG_INFO, "Plik bledow skasowany zdalnie");
+      server.send(200, "text/plain; charset=utf-8", "Plik bledow skasowany.\n");
+    } else {
+      server.send(500, "text/plain; charset=utf-8", "Nie udalo sie skasowac pliku.\n");
+    }
+    return;
+  }
+
+  // Najpierw wczytaj plik, żeby znać liczbę wpisów - potem buduj nagłówek.
+  String body;
+  body.reserve(4096);
+  size_t fileSize = 0;
+  if (fsReady) {
+    File f = LittleFS.open(ERR_FILE, "r");
+    if (f) {
+      fileSize = f.size();
+      errFileLines = 0;
+      while (f.available() && body.length() < 10000) {
+        String ln = f.readStringUntil('\n');
+        if (ln.length() > 0) errFileLines++;
+        body += ln;
+        body += '\n';
+      }
+      f.close();
+    } else {
+      errFileLines = 0;
+    }
+  }
+
+  String out;
+  out.reserve(2048);
+  out += "=== PLIK BLEDOW (" + String(ERR_FILE) + ") ===\n";
+  out += "Zapis do pliku : " + String(fsReady ? "OK" : "NIEDOSTEPNY (brak LittleFS)") + "\n";
+  if (fsReady) {
+    out += "Miejsce        : " + String(LittleFS.usedBytes()) + " / " + String(LittleFS.totalBytes()) + " B\n";
+    out += "Rozmiar pliku  : " + String(fileSize) + " B (limit " + String(ERR_MAX_BYTES) + " B)\n";
+    out += "Wpisów         : " + String(errFileLines) + "\n";
+  }
+  out += "Retencja       : " + String(ERR_KEEP_DAYS) + " dni (starsze kasowane automatycznie)\n";
+  out += "Czas z NTP     : " + String(ntpSynced ? "zsynchronizowany" : "brak (uzywam czasu pracy)") + "\n";
+  out += "Do pliku trafiaja TYLKO bledy. Zwykle zdarzenia sa w /log (RAM).\n";
+  out += "\nKasowanie: /errors?clear=1\n";
+  out += "----------------------------------------\n";
+  if (body.length() == 0) out += "(plik pusty - brak bledow)\n";
+  else out += body;
+  server.send(200, "text/plain; charset=utf-8", out);
+}
+
+// /errtest - zapisuje testowy błąd do pliku (weryfikacja, że zapis działa)
+void handleErrTest() {
+  logEventS(LOG_ERROR, "Test zapisu bledu do pliku");
+  String out = "Zapisano testowy blad.\nSprawdz /errors\n";
+  server.send(200, "text/plain; charset=utf-8", out);
+}
+
+// ==================== SYNCHRONIZACJA CZASU (NTP) ====================
+// Potrzebna, żeby wpisy w pliku błędów miały prawdziwą datę i żeby działało
+// kasowanie wpisów starszych niż 7 dni.
+void timeBegin() {
+  // Strefa czasowa Polski (CET/CEST) - automatyczna zmiana czasu.
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
+  Serial.println("NTP: konfiguracja wyslana (CET/CEST)");
+}
+
+void timeGuard() {
+  static unsigned long last = 0;
+  if (ntpSynced) return;
+  if (millis() - last < 15000) return;
+  last = millis();
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  struct tm ti;
+  if (getLocalTime(&ti, 0)) {
+    ntpSynced = true;
+    char b[24];
+    snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
+             ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday, ti.tm_hour, ti.tm_min, ti.tm_sec);
+    logEventS(LOG_INFO, "Czas NTP zsynchronizowany: " + String(b));
+    errFileRotate(true);   // teraz znamy czas - przytnij stare wpisy
+  }
+}
+
+// ==================== NADZOR NAD WiFi ====================
+// Jeśli połączenie z siecią domową padnie, próbuj wrócić i zaloguj zdarzenie.
+void wifiGuard() {
+  static unsigned long lastCheck = 0;
+  static bool wasConnected = false;
+  static unsigned long lastAttempt = 0;
+
+  if (millis() - lastCheck < 5000) return;
+  lastCheck = millis();
+
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  if (connected) {
+    if (!wasConnected) {
+      wasConnected = true;
+      logEventS(LOG_INFO, "WiFi polaczone: " + WiFi.localIP().toString());
+    }
+    return;
+  }
+
+  if (wasConnected) {
+    wasConnected = false;
+    logEventS(LOG_WARN, "WiFi rozlaczone - probuje polaczyc ponownie");
+  }
+  if (wifiCfg.staSsid.length() == 0) return;      // brak skonfigurowanego STA
+  if (millis() - lastAttempt < 20000) return;     // nie częściej niż co 20 s
+  lastAttempt = millis();
+  statWifiRecon++;
+  WiFi.disconnect();
+  WiFi.begin(wifiCfg.staSsid.c_str(), wifiCfg.staPass.c_str());
 }
 
 // ==================== SETUP ====================
@@ -3527,6 +4333,34 @@ void setup() {
   radioSPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI);
 
   memset(comboHits, 0, sizeof(comboHits));
+
+  // --- Przyczyna restartu + liczniki (pamiec RTC przezywa restart) ---
+  bootResetReason = esp_reset_reason();
+  if (rtcMagic != RTC_MAGIC) {
+    // Pierwszy start po włączeniu zasilania - pamięć RTC zawiera śmieci.
+    rtcMagic = RTC_MAGIC;
+    rtcBootCount = 0; rtcWdtResets = 0; rtcBrownouts = 0;
+    rtcPanics = 0; rtcHangResets = 0; rtcLastMaxLoopMs = 0;
+  }
+  rtcBootCount++;
+  if (bootResetReason == ESP_RST_TASK_WDT || bootResetReason == ESP_RST_INT_WDT ||
+      bootResetReason == ESP_RST_WDT) rtcWdtResets++;
+  else if (bootResetReason == ESP_RST_BROWNOUT) rtcBrownouts++;
+  else if (bootResetReason == ESP_RST_PANIC)    rtcPanics++;
+
+  Serial.print("Powod restartu: ");
+  Serial.println(resetReasonText(bootResetReason));
+  startTime = millis();
+  statHeapMin = ESP.getFreeHeap();
+  logEvent(LOG_INFO, String("Start #") + String(rtcBootCount) + ": " +
+           String(resetReasonText(bootResetReason)));
+  if (bootResetReason == ESP_RST_BROWNOUT)
+    logEventS(LOG_ERROR, "BROWNOUT! Slabe zasilanie (kondensator/przewody?)");
+  else if (bootResetReason == ESP_RST_TASK_WDT || bootResetReason == ESP_RST_INT_WDT ||
+           bootResetReason == ESP_RST_WDT)
+    logEventS(LOG_ERROR, "Restart przez WATCHDOG - firmware sie zawiesil");
+  else if (bootResetReason == ESP_RST_PANIC)
+    logEventS(LOG_ERROR, "Restart po CRASH (panic)");
 
   ccInitBase();
   Serial.print("CC1101 VERSION=0x");
@@ -3570,7 +4404,7 @@ void setup() {
 
   // Filtr ramek
   loadFilterCfg();
-  Serial.print("Filtr ramek: ");
+  Serial.print("Filtr ramek / Frame filter: ");
   Serial.println(filterCfg.enabled ? "WLACZONY" : "WYLACZONY");
   if (filterCfg.enabled) {
     Serial.println("  wzorzec: " + filterCfg.pattern);
@@ -3603,6 +4437,10 @@ void setup() {
     Serial.println("Nie polaczono z STA (SSID: " + wifiCfg.staSsid + ")");
   }
 
+  // System plików na błędy + synchronizacja czasu (dla dat w pliku błędów).
+  errFileBegin();
+  timeBegin();
+
   server.on("/", handleRoot);
   server.on("/json", handleJson);
   server.on("/clear", handleClear);
@@ -3626,15 +4464,44 @@ void setup() {
   server.on("/selftest", handleSelfTest);
   server.on("/update", HTTP_GET, handleOtaForm);
   server.on("/update", HTTP_POST, handleOtaUpdate, handleOtaUpload);
+  server.on("/log", handleLog);
+  server.on("/status", handleStatus);
+  server.on("/reboot", handleReboot);
+  server.on("/errors", handleErrorsPage);
+  server.on("/errtest", handleErrTest);
   server.begin();
   Serial.println("Web server na porcie 80");
 
   startTime = millis();
   Serial.println("Nasluch...\n");
+
+  logEventS(LOG_INFO, "System gotowy - nasluch uruchomiony");
+  // Watchdog startuje NA KOŃCU setup - od tego momentu loop() musi go karmić.
+  wdtBegin();
+  Serial.println(wdtEnabled ? "Watchdog: wlaczony (30 s)" : "Watchdog: NIE udalo sie wlaczyc");
 }
+
 
 // ==================== LOOP ====================
 void loop() {
+  // --- Statystyki + karmienie watchdoga ---
+  // Czas poprzedniego przebiegu mierzymy na POCZATKU kolejnego, bo loop() ma
+  // wiele instrukcji `return` (nie da sie zmierzyc na koncu).
+  static unsigned long prevLoopStart = 0;
+  unsigned long nowMs = millis();
+  if (prevLoopStart) {
+    uint32_t dur = (uint32_t)(nowMs - prevLoopStart);
+    statLastLoopMs = (int)dur;
+    if (dur > statMaxLoopMs) statMaxLoopMs = dur;
+    if (dur > rtcLastMaxLoopMs && dur < 60000) rtcLastMaxLoopMs = dur;
+  }
+  prevLoopStart = nowMs;
+  statLoopCount++;
+  uint32_t heapNow = ESP.getFreeHeap();
+  if (heapNow < statHeapMin) statHeapMin = heapNow;
+
+  wdtFeed();
+
   server.handleClient();
 
   // UWAGA: NIE uruchamiamy tu ccSpiAutotune() cyklicznie. Test SPI (24 zapisy
@@ -3651,6 +4518,11 @@ void loop() {
     loopCapture();
     return;
   }
+
+  // Nadzór nad WiFi (ponowne łączenie + log zdarzeń)
+  wifiGuard();
+  timeGuard();      // synchronizacja czasu (dla dat w pliku błędów)
+  heapGuard();      // ochrona RAM przed wyczerpaniem
 
   // Obsługa MQTT (niezależnie od trybu pracy radia)
   mqttEnsureConnected();

@@ -192,6 +192,57 @@ Firmware sam sprawdza tor SPI i wypisuje wynik na porcie szeregowym (115200):
 Test powtarzany jest co 30 s, więc jeśli połączenie się pogorszy, firmware sam
 przejdzie na wolniejszą prędkość SPI.
 
+### Zdalna diagnostyka, log błędów i watchdog
+
+Cała strona WWW jest **dwujęzyczna (polski / angielski)** — etykiety mają obie
+wersje, np. „Temperatura / Temperature".
+
+| Adres | Co pokazuje |
+|---|---|
+| `/` | odczyt na żywo (odświeżanie przez JavaScript, **bez przeładowania strony**) |
+| `/log` | log zdarzeń + pełny stan radia i systemu (widok konsoli, PL/EN) |
+| `/log?raw=1` | to samo jako czysty tekst (do skryptów) |
+| `/errors` | plik błędów z przyciskiem kasowania i testu |
+| `/errors?raw=1` | plik błędów jako tekst |
+| `/errors?clear=1` | skasowanie pliku błędów |
+| `/status` | stan w JSON (do skryptów / Home Assistant) |
+| `/update` | aktualizacja firmware przez przeglądarkę (OTA) |
+| `/reboot` | zdalny restart |
+
+**Watchdog:** firmware pilnuje się sprzętowym watchdogiem (30 s). Jeśli pętla
+główna się zawiesi, ESP restartuje się sam i po restarcie **zapisuje przyczynę**
+(`watchdog`, `brownout`, `crash`) — widać ją na stronie i w `/log`.
+
+**Log zdarzeń w RAM:** bufor kołowy (40 wpisów). Nowe zdarzenia nadpisują
+najstarsze, więc pamięć **nigdy się nie zapełni** — nie trzeba nic kasować.
+
+**Plik błędów:** do pliku na flashu (`/bledy.log`) trafiają **tylko błędy**
+(zwykłe zdarzenia zostają w RAM). Plik ma wbudowaną rotację, żeby miejsce nigdy
+się nie skończyło:
+- maksymalny rozmiar 16 kB — po przekroczeniu zostają najnowsze wpisy (8 kB),
+- wpisy **starsze niż 7 dni** są kasowane automatycznie (wymaga czasu z NTP),
+- ręczne kasowanie: `/errors?clear=1`.
+
+**Ochrona pamięci:** firmware sprawdza co minutę ilość wolnej pamięci RAM.
+Jeśli spadnie poniżej 12 kB, restartuje się *zanim* zabraknie pamięci (a zdarzenie
+zapisuje do pliku błędów). Dzięki temu urządzenie może pracować tygodniami.
+
+### Diagnostyka radia (English)
+
+Firmware sam sprawdza tor SPI i wypisuje wynik na porcie szeregowym (115200):
+
+- `SPI autotune: 4000k=A5 ... -> OK, wybrano X kHz` — zapis do CC1101 dociera,
+  wybrano najszybszą działającą prędkość SPI. `A5` to wartość, którą zapisano
+  i odczytano z powrotem.
+- `CC1101 VERSION=0x14 PARTNUM=0x0` — układ odpowiada prawidłowo.
+- `CC1101: RX aktywny (MARCSTATE=0x0D)` — radio weszło w odbiór.
+- `-> BLAD: zapis do CC1101 nie dociera...` — sygnał problemu z okablowaniem.
+  Na płytce WROOM najczęstsza przyczyna to **CSN na GPIO5** (patrz tabela
+  podłączenia wyżej).
+
+Test powtarzany jest co 30 s, więc jeśli połączenie się pogorszy, firmware sam
+przejdzie na wolniejszą prędkość SPI.
+
 ### Kalibracja
 
 W zakładce **Kalibracja** można ustawić poprawki temperatury, wilgotności, mnożnik wiatru
@@ -372,7 +423,41 @@ by `pio run -e esp32-wroom` at `.pio/build/esp32-wroom/firmware.bin`.
 > writes only the application, so NVS survives. After such a flash the device
 > boots in AP mode and WiFi must be configured again.
 
-### Radio diagnostics
+### Remote diagnostics, error log and watchdog
+
+The whole web UI is **bilingual (Polish / English)** — labels carry both versions,
+e.g. "Temperatura / Temperature".
+
+| URL | What it shows |
+|---|---|
+| `/` | live reading (refreshed by JavaScript, **no page reload**) |
+| `/log` | event log + full radio and system status (console view, PL/EN) |
+| `/log?raw=1` | the same as plain text (for scripts) |
+| `/errors` | error file with clear and test buttons |
+| `/errors?raw=1` | error file as plain text |
+| `/errors?clear=1` | delete the error file |
+| `/status` | status as JSON (for scripts / Home Assistant) |
+| `/update` | firmware update from the browser (OTA) |
+| `/reboot` | remote reboot |
+
+**Watchdog:** the firmware guards itself with a hardware watchdog (30 s). If the
+main loop hangs, the ESP reboots on its own and **records the reason** after
+restart (`watchdog`, `brownout`, `crash`) — visible on the page and in `/log`.
+
+**RAM event log:** a ring buffer (40 entries). New events overwrite the oldest,
+so memory **never fills up** — nothing to clear manually.
+
+**Error file:** only **errors** go to the flash file (`/bledy.log`) — regular
+events stay in RAM. The file rotates so space never runs out:
+- maximum size 16 kB — beyond that only the newest entries (8 kB) are kept,
+- entries **older than 7 days** are deleted automatically (needs NTP time),
+- manual clear: `/errors?clear=1`.
+
+**Memory guard:** every minute the firmware checks free RAM. If it drops below
+12 kB it restarts *before* memory runs out (and writes the event to the error
+file). This lets the device run for weeks.
+
+### Radio diagnostics (original section)
 
 The firmware validates the SPI path by itself and prints the result on the serial
 port (115200):
