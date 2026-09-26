@@ -29,13 +29,78 @@ via a web page, JSON, HTTP and MQTT.
 - Narzędzia diagnostyczne: skan surowych ramek, pomiar RSSI, detektor burstów, autotest
   dekoderów i test SPI.
 
-### WAŻNE — jaka stacja pogodowa jest potrzebna
+### Obsługiwane stacje pogodowe
 
-Ten firmware powstał i został przetestowany pod stację:
+Firmware ma kilka dekoderów (wzorowanych na bibliotece **rtl_433**) i tryb **AUTO**,
+który sam sprawdza po kolei wszystkie protokoły. Poniżej pełna lista:
 
-- **VEVOR / Youtong 7-w-1**, model **YT60231** — wersja europejska **868 MHz**
-  (sprzedawana m.in. pod marką VEVOR; to stacja z protokołem „263", który dekoduje rtl_433
-  jako `vevor_7in1`).
+| Tryb / dekoder | Stacja | Częstotliwość | Protokół |
+|---|---|---|---|
+| `vevor` ⭐ | **VEVOR / Youtong 7-w-1 — YT60231** (EU) | 868.30 MHz | 2-FSK 11.11k, sync `CA 54`, 263 (`vevor_7in1` w rtl_433) |
+| `vevor` | VEVOR / Youtong 7-w-1 — **YT60238, YT60240, LWS234** | 868.30 MHz | ten sam protokół 263 |
+| `vevor` | **VEVOR YT60234** (USA) | 915 MHz | ten sam protokół, inne skalowanie wiatru i opadu |
+| `vevor_yt60309` | **VEVOR / Youtong YT60309** (CMT2119A) | 868.30 / **868.35** MHz | 2-FSK 11.11k, sync `C0AA C0AA`, 32 bajty |
+| `fine_offset` | **Fine Offset WH24 / WH65 / WS69** (rodzina 0x24) | 868.30 MHz | 2-FSK 17.24k, sync `2D D4`, 17 bajtów, CRC-8 |
+| `bresser` | **Bresser 5-w-1 / 6-w-1 / 7-w-1** (np. 7002510, 7002520, 7002580) | 868.30 MHz | 2-FSK ~8.21k, sync `AA 2D`, 27 bajtów |
+| `auto` | wszystkie powyższe po kolei | 868.20 / 868.30 / 868.35 / 868.40 / 868.95 / 433.92 MHz | po 20 s na kombinację, wybiera pierwszy działający |
+| `raw_scan` | dowolny nadajnik (tryb diagnostyczny) | 6 częstotliwości × 8 profili | surowe ramki, bez dekodowania |
+
+⭐ = tryb domyślny i **przetestowany na prawdziwym sprzęcie**.
+
+> Stacje z tej samej rodziny (np. rebrandy VEVOR, Youtong, LWS) używają **tego samego
+> protokołu**, więc zwykle działają od razu. Jeśli Twoja stacja nadaje inaczej, użyj
+> trybu **AUTO** albo trybu **raw_scan** i prześlij zebrane ramki — wtedy dopiszę dekoder.
+
+Dane dekodowane z każdej stacji: temperatura, wilgotność, prędkość wiatru (średnia),
+poryw wiatru, kierunek wiatru (16 kierunków), suma opadu, indeks UV, natężenie światła (lux),
+flaga baterii oraz ID nadajnika (zależnie od tego, co dana stacja wysyła).
+
+> **Ciśnienie atmosferyczne NIE jest przesyłane przez radio.** Barometr znajduje się w konsoli
+> (wyświetlaczu), a nie w czujniku zewnętrznym — dlatego odbiornik nie może go odebrać. To
+> dotyczy wszystkich stacji z tej listy.
+
+### WAŻNE — jakiego modułu radiowego użyć (nie klona!)
+
+Do tego odbiornika potrzebny jest **prawdziwy moduł CC1101** na **868 MHz**, najlepiej
+sprawdzony odpowiednik modułów **RadioControl** / **ELECHOUSE** (np. ten sam, co w projekcie
+`WMBUS_RadioControl_866MHz`). Ten firmware był pisany i testowany na takim module.
+
+**Nie używaj tanich klonów.** Klony CC1101 (głównie z aukcji „CC1101 868MHz" bez marki) bardzo
+często mają:
+- **zły rezonator/kwarc** (np. 27 MHz zamiast **26 MHz**) — wtedy odbiornik działa na złej
+  częstotliwości i łapie tylko szum; objaw: `VERSION=0x14` jest OK, ale stacja nie jest
+  odbierana,
+- brak ekranowania i słabe filtry — duży szum własny (wysoki „podłogowy" RSSI),
+- brak kondensatorów odsprzęgających przy układzie — radio niestabilnie startuje.
+
+Zły moduł można rozpoznać po tym, że **ta sama stacja i ten sam firmware** na oryginalnym
+module działa, a na klonie nie — mimo poprawnych połączeń SPI.
+
+**Jak sprawdzić, czy moduł jest dobry** (wbudowana diagnostyka):
+- `CC1101 VERSION=0x14 PARTNUM=0x0` — układ odpowiada prawidłowo,
+- `SPI autotune: ... -> OK` — zapisy do rejestrów docierają,
+- `CC1101: RX aktywny (MARCSTATE=0x0D)` — radio weszło w odbiór,
+- `RSSI` przy braku transmisji powinien być niski (np. -100…-110 dBm). Jeśli „na pusto"
+  pokazuje -70 dBm i więcej, moduł ma duży szum własny (typowe dla klonów) albo jest
+  zagłuszany.
+
+#### Gdzie kupić porządny moduł (sprawdzone linki)
+
+| Moduł | Sklep | Uwagi |
+|---|---|---|
+| **[RADIOCONTROLLI RC-CC1101-SPI-868 (THT)](https://www.tme.eu/pl/details/rc-cc1101-spi-868/moduly-rf/radiocontrolli/)** | **TME** | ⭐ polecany — profesjonalny moduł RadionControlli, 868 MHz, SPI, czułość -110 dBm, 1,8–3,6 V, 10 dBm, obudowa 21,5×15,6 mm, montaż przewlekany |
+| **[RADIOCONTROLLI RC-CC1101-SPI-SMT-868 (SMD)](https://www.tme.eu/pl/details/rc-cc1101-smt-868/moduly-rf/radiocontrolli/)** | **TME** | ta sama rodzina, wersja do montażu powierzchniowego 15×18 mm |
+| [Moduł radiowy CC1101 RF 868 MHz z anteną](https://sklep.msalamon.pl/produkt/modul-radiowy-cc1101-rf-868-mhz-z-antena/) | msalamon.pl | tani moduł typu „płytka z anteną" — działa, ale to typowy klon; sprawdź, czy odbiera (patrz diagnostyka wyżej) |
+| [Wyszukiwanie „CC1101 868 MHz"](https://allegro.pl/listing?string=cc1101%20868mhz) | Allegro | najtaniej, ale **największe ryzyko trafienia na klona** ze złym kwarcem |
+
+**Zalecenie:** jeśli zależy Ci na pewnym odbiorze słabych ramek ze stacji oddalonej o
+kilkadziesiąt metrów, kup moduł z **TME (RadionControlli)** — jest droższy (~60 zł), ale ma
+poprawny kwarc 26 MHz, lepsze filtry i powtarzalne parametry. Tanie moduły z Allegro
+(~15 zł) często wymagają dołożenia kondensatora 100 nF + 10 µF przy VCC i mimo to bywają
+mniej czułe.
+
+> Uwaga: nie każdy „CC1101 868 MHz" z aukcji ma wlutowany rezonator **26 MHz**. Zdarzają się
+> płytki z rezonatorem 27 MHz (od wersji 433 MHz) — taki moduł **nie odbierze 868 MHz**.
 
 Parametry radiowe, które **musi** spełniać nadajnik w czujniku zewnętrznym:
 
@@ -279,35 +344,76 @@ Dekodery zostały przeniesione/oparte na:
 - Data forwarding via HTTP (JSON POST), MQTT and RS485.
 - Diagnostic tools: raw frame scan, RSSI measurement, burst detector, decoder self-test and SPI test.
 
-### IMPORTANT — which weather station is required
+### Supported weather stations
 
-This firmware was built and tested against:
+The firmware contains several decoders (modelled on **rtl_433**) plus an **AUTO** mode that
+tries every protocol in turn. Full list:
 
-- **VEVOR / Youtong 7-in-1**, model **YT60231** — the European **868 MHz** version
-  (sold under the VEVOR brand; the station that speaks "protocol 263", decoded by rtl_433
-  as `vevor_7in1`).
+| Mode / decoder | Station | Frequency | Protocol |
+|---|---|---|---|
+| `vevor` ⭐ | **VEVOR / Youtong 7-in-1 — YT60231** (EU) | 868.30 MHz | 2-FSK 11.11k, sync `CA 54`, protocol 263 (`vevor_7in1` in rtl_433) |
+| `vevor` | VEVOR / Youtong 7-in-1 — **YT60238, YT60240, LWS234** | 868.30 MHz | same protocol 263 |
+| `vevor` | **VEVOR YT60234** (US) | 915 MHz | same protocol, different wind/rain scaling |
+| `vevor_yt60309` | **VEVOR / Youtong YT60309** (CMT2119A) | 868.30 / **868.35** MHz | 2-FSK 11.11k, sync `C0AA C0AA`, 32 bytes |
+| `fine_offset` | **Fine Offset WH24 / WH65 / WS69** (family 0x24) | 868.30 MHz | 2-FSK 17.24k, sync `2D D4`, 17 bytes, CRC-8 |
+| `bresser` | **Bresser 5-in-1 / 6-in-1 / 7-in-1** (e.g. 7002510, 7002520, 7002580) | 868.30 MHz | 2-FSK ~8.21k, sync `AA 2D`, 27 bytes |
+| `auto` | all of the above, one after another | 868.20 / 868.30 / 868.35 / 868.40 / 868.95 / 433.92 MHz | 20 s per combination, picks the first that works |
+| `raw_scan` | any transmitter (diagnostic mode) | 6 frequencies × 8 profiles | raw frames, no decoding |
 
-The outdoor sensor transmitter must match these RF parameters:
+⭐ = default mode, **tested on real hardware**.
 
-| Parameter | Value |
-|---|---|
-| Frequency | **868.30 MHz** |
-| Modulation | 2-FSK, ~11.11 kbaud, ~70 kHz deviation |
-| TX interval | every **~20 s** (burst ~85 ms) |
-| Preamble / sync | `AA AA AA AA AA CA CA 54` (sync word `CA 54`) |
-| Frame length | 28 bytes after the sync word |
-| Checksum | `sum of b[0..18] mod 256 == b[19]` |
+> Stations from the same family (VEVOR/Youtong/LWS rebrands) use the **same protocol**, so they
+> normally work out of the box. If your station transmits differently, use **AUTO** or
+> **raw_scan** and send me the captured frames — I will add a decoder.
 
-The station transmits: temperature, humidity, average wind speed, wind gust, wind direction
-(16 directions), rain total, UV index, light (lux), battery flag and transmitter ID.
+Decoded from each station: temperature, humidity, average wind speed, wind gust, wind direction
+(16 directions), rain total, UV index, light (lux), battery flag and transmitter ID
+(depending on what that station transmits).
 
 > **Atmospheric pressure is NOT transmitted over the radio.** The barometer is inside the
-> console (display), not in the outdoor sensor — so the receiver cannot pick it up. The console's
-> "baro relative" (sea-level adjusted) and "baro absolute" (actual at the console location) both
-> come from its internal barometer.
+> console (display), not in the outdoor sensor — so the receiver cannot pick it up. This applies
+> to every station in the list above.
 
-> The **915 MHz (US, YT60234)** version uses the same protocol but different wind/rain scaling.
-> This firmware is calibrated for the **868 MHz EU** version.
+### IMPORTANT — which radio module to use (not a clone!)
+
+You need a **genuine CC1101** module for **868 MHz** — ideally a proven **RADIOCONTROLLI** /
+**ELECHOUSE**-class part (the same kind used in the `WMBUS_RadioControl_866MHz` project).
+This firmware was written and tested on such a module.
+
+**Do not use cheap clones.** Unbranded "CC1101 868MHz" boards very often have:
+- the **wrong crystal/resonator** (e.g. 27 MHz instead of **26 MHz**) — the receiver then works
+  on the wrong frequency and only picks up noise; symptom: `VERSION=0x14` is fine but the
+  station is never received,
+- no shielding and poor filters — high self-noise (a high "noise floor" RSSI),
+- no decoupling capacitors at the chip — the radio starts unreliably.
+
+A bad module is recognisable by this: **the same station and the same firmware** works on a
+genuine module but not on the clone, despite correct SPI wiring.
+
+**How to check that your module is good** (built-in diagnostics):
+- `CC1101 VERSION=0x14 PARTNUM=0x0` — the chip responds correctly,
+- `SPI autotune: ... -> OK` — register writes arrive,
+- `CC1101: RX aktywny (MARCSTATE=0x0D)` — the radio entered RX,
+- the idle `RSSI` should be low (e.g. -100…-110 dBm). If it reads -70 dBm or higher with no
+  transmission, the module has high self-noise (typical for clones) or is being jammed.
+
+#### Where to buy a good module (verified links)
+
+| Module | Shop | Notes |
+|---|---|---|
+| **[RADIOCONTROLLI RC-CC1101-SPI-868 (THT)](https://www.tme.eu/pl/details/rc-cc1101-spi-868/moduly-rf/radiocontrolli/)** | **TME** | ⭐ recommended — professional RADIOCONTROLLI module, 868 MHz, SPI, -110 dBm sensitivity, 1.8–3.6 V, 10 dBm, 21.5×15.6 mm, through-hole |
+| **[RADIOCONTROLLI RC-CC1101-SPI-SMT-868 (SMD)](https://www.tme.eu/pl/details/rc-cc1101-smt-868/moduly-rf/radiocontrolli/)** | **TME** | same family, surface-mount version 15×18 mm |
+| [CC1101 RF 868 MHz module with antenna](https://sklep.msalamon.pl/produkt/modul-radiowy-cc1101-rf-868-mhz-z-antena/) | msalamon.pl | cheap "board with antenna" type — it works, but it is a typical clone; verify reception (see diagnostics above) |
+| [Search "CC1101 868 MHz"](https://allegro.pl/listing?string=cc1101%20868mhz) | Allegro | cheapest, but **highest risk of a clone** with the wrong crystal |
+
+**Recommendation:** if you need reliable reception of weak frames from a station tens of metres
+away, buy the **TME (RADIOCONTROLLI)** module — it costs more (~60 PLN) but has a correct 26 MHz
+crystal, better filters and repeatable parameters. Cheap ~15 PLN boards often need an extra
+100 nF + 10 µF capacitor at VCC and are still less sensitive.
+
+> Note: not every "CC1101 868 MHz" auction listing has a **26 MHz** resonator fitted. Boards
+> with a 27 MHz resonator (from the 433 MHz version) exist — such a module **will not receive
+> 868 MHz**.
 
 ### Hardware & wiring
 

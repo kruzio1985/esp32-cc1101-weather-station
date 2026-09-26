@@ -59,7 +59,7 @@ struct WifiCfg {
 };
 WifiCfg wifiCfg;
 
-// Filtr ramek / Frame filter: radio odbiera nadal WSZYSTKO, ale gdy filtr jest włączony,
+// «Filtr ramek|Frame filter»: radio odbiera nadal WSZYSTKO, ale gdy filtr jest włączony,
 // do bufora (strona WWW / JSON / później RS485) trafiają tylko ramki pasujące
 // do wzorca (np. identyfikator urządzenia stacji pogody). Reszta jest tylko
 // zliczana i pokazywana na porcie szeregowym.
@@ -295,6 +295,65 @@ unsigned long rejectedFrames = 0; // odrzucone przez filtr
 unsigned long startTime = 0;
 int comboHits[6][8];  // licznik trafień per (freq, prof)
 
+// ==================== JĘZYK INTERFEJSU (PL / EN) ====================
+// 0 = polski, 1 = english. Ustawiane przez ?lang=pl / ?lang=en albo przyciskiem
+// flagi na stronie (zapis w localStorage przeglądarki).
+// W HTML etykiety dwujęzyczne zapisujemy jako «polski|english» - skrypt na
+// stronie zamienia to na wybrany język, więc nie ma podwójnych opisów.
+int gLang = 0;
+
+String T(const String& pl, const String& en) {
+  return gLang == 0 ? pl : en;
+}
+
+// Zwraca tekst "polski" z markera «polski|english» (albo tekst bez zmian).
+// Używane do portu szeregowego i pliku błędów, żeby tam nie trafiały markery.
+String stripLang(const String& s) {
+  int a = s.indexOf("«");
+  if (a < 0) return s;
+  int b = s.indexOf("|", a);
+  int c = s.indexOf("»", a);
+  if (b < 0 || c < 0 || b > c) return s;
+  return s.substring(0, a) + s.substring(a + 1, b) + s.substring(c + 1);
+}
+
+// Pasek wyboru języka (flagi).
+String langBar() {
+  return "<span id='langbar' style='white-space:nowrap'>"
+         "<a href='#' onclick=\"setLang('pl');return false\" id='l-pl' title='Polski'>🇵🇱 PL</a>"
+         "<a href='#' onclick=\"setLang('en');return false\" id='l-en' title='English'>🇬🇧 EN</a>"
+         "</span>";
+}
+
+// Skrypt zamieniający markery «PL|EN» na wybrany język (bez przeładowania).
+String langScript() {
+  return
+    "<script>"
+    "var RE=/«([^|»]*)\\|([^»]*)»/g;"
+    "function L(p,e){return (window.__lang==='en')?e:p;}"
+    "function applyLang(l){"
+    "window.__lang=l;"
+    "var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false);"
+    "var n;"
+    "while((n=w.nextNode())){"
+    "if(n.__o===undefined)n.__o=n.nodeValue;"
+    "if(n.__o.indexOf('«')<0)continue;"
+    "n.nodeValue=n.__o.replace(RE,function(m,a,b){return l==='en'?b:a;});}"
+    "var t=document.querySelector('title');"
+    "if(t){var to=t.getAttribute('data-o');"
+    "if(to===null){to=t.textContent;t.setAttribute('data-o',to);}"
+    "t.textContent=to.replace(RE,function(m,a,b){return l==='en'?b:a;});}"
+    "var ap=document.getElementById('l-pl'),ae=document.getElementById('l-en');"
+    "if(ap)ap.style.opacity=(l==='pl')?'1':'0.4';"
+    "if(ae)ae.style.opacity=(l==='en')?'1':'0.4';"
+    "}"
+    "function setLang(l){try{localStorage.setItem('wsLang',l);}catch(e){}applyLang(l);"
+    "if(window.__reloadText)window.__reloadText();}"
+    "function initLang(){var l='pl';try{l=localStorage.getItem('wsLang')||'pl';}catch(e){}applyLang(l);}"
+    "if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initLang);else initLang();"
+    "</script>";
+}
+
 // ==================== LOG ZDARZEŃ / DIAGNOSTYKA SYSTEMU ====================
 // Prosty log w RAM (bufor kołowy) + liczniki w pamięci RTC, która przeżywa
 // restart (ale NIE odcięcie zasilania). Dzięki temu po nieoczekiwanym
@@ -332,8 +391,8 @@ void logEventS(uint8_t level, const String& msg) {
   Serial.print((millis() - startTime) / 1000);
   Serial.print("s] ");
   Serial.print(level == LOG_ERROR ? "BLAD  " : (level == LOG_WARN ? "UWAGA " : "INFO  "));
-  Serial.println(msg);
-  if (level == LOG_ERROR) errFileAppend(msg);
+  Serial.println(stripLang(msg));
+  if (level == LOG_ERROR) errFileAppend(stripLang(msg));
 }
 
 // --- Pamięć RTC: przeżywa restart programowy / watchdog / panic ---
@@ -362,17 +421,17 @@ int      statLastLoopMs  = 0;
 
 const char* resetReasonText(esp_reset_reason_t r) {
   switch (r) {
-    case ESP_RST_POWERON:   return "wlaczenie zasilania";
-    case ESP_RST_EXT:       return "reset zewnetrzny (EN/RST)";
-    case ESP_RST_SW:        return "restart programowy";
-    case ESP_RST_PANIC:     return "PANIC - crash firmware";
-    case ESP_RST_INT_WDT:   return "watchdog przerwan - ZAWIESZENIE";
-    case ESP_RST_TASK_WDT:  return "watchdog zadania - ZAWIESZENIE";
-    case ESP_RST_WDT:       return "watchdog - ZAWIESZENIE";
-    case ESP_RST_BROWNOUT:  return "BROWNOUT - spadek napiecia!";
-    case ESP_RST_DEEPSLEEP: return "wybudzenie z deep sleep";
-    case ESP_RST_SDIO:      return "reset SDIO";
-    default:                return "nieznany";
+    case ESP_RST_POWERON:   return "«wlaczenie zasilania|power on»";
+    case ESP_RST_EXT:       return "«reset zewnetrzny (EN/RST)|external reset (EN/RST)»";
+    case ESP_RST_SW:        return "«restart programowy|software restart»";
+    case ESP_RST_PANIC:     return "«PANIC - crash firmware|PANIC - firmware crash»";
+    case ESP_RST_INT_WDT:   return "«watchdog przerwan - ZAWIESZENIE|interrupt watchdog - HANG»";
+    case ESP_RST_TASK_WDT:  return "«watchdog zadania - ZAWIESZENIE|task watchdog - HANG»";
+    case ESP_RST_WDT:       return "«watchdog - ZAWIESZENIE|watchdog - HANG»";
+    case ESP_RST_BROWNOUT:  return "«BROWNOUT - spadek napiecia!|BROWNOUT - supply voltage drop!»";
+    case ESP_RST_DEEPSLEEP: return "«wybudzenie z deep sleep|woke from deep sleep»";
+    case ESP_RST_SDIO:      return "«reset SDIO|SDIO reset»";
+    default:                return "«nieznany|unknown»";
   }
 }
 
@@ -556,13 +615,13 @@ void heapGuard() {
   if (h < statHeapMin) statHeapMin = h;
 
   if (h < HEAP_MIN_RESET) {
-    logEvent(LOG_ERROR, "Krytycznie malo RAM: " + String(h) + " B - restart");
-    errFileAppend("Krytycznie malo RAM: " + String(h) + " B - restart");
+    logEvent(LOG_ERROR, "«Krytycznie malo RAM|Critically low RAM»: " + String(h) + " B - «restart|restart»");
+    errFileAppend("«Krytycznie malo RAM|Critically low RAM»: " + String(h) + " B - «restart|restart»");
     delay(300);
     ESP.restart();
   } else if (h < HEAP_MIN_ALERT && !warned) {
     warned = true;
-    logEvent(LOG_WARN, "Malo wolnej pamieci RAM: " + String(h) + " B");
+    logEvent(LOG_WARN, "«Malo wolnej pamieci RAM|Low free RAM»: " + String(h) + " B");
   } else if (h > HEAP_MIN_ALERT * 2) {
     warned = false;   // pamięć wróciła - uzbrój ostrzeżenie ponownie
   }
@@ -757,13 +816,13 @@ bool ccSpiAutotune() {
     Serial.println(" kHz");
     if (chosen < 1000000) {
       statSpiFallback++;
-      logEventS(LOG_WARN, "SPI obnizone do " + String(chosen / 1000) + " kHz (slabe polaczenie)");
+      logEventS(LOG_WARN, "«SPI obnizone do|SPI lowered to» " + String(chosen / 1000) + " kHz («slabe polaczenie|weak connection»)");
     }
     return true;
   }
   gSpiHz = 100000;
   Serial.println("  -> BLAD: zapis do CC1101 nie dociera przy zadnej predkosci!");
-  logEventS(LOG_ERROR, "Zapis do CC1101 nie dociera - sprawdz okablowanie");
+  logEventS(LOG_ERROR, "«Zapis do CC1101 nie dociera - sprawdz okablowanie|Writes to CC1101 do not arrive - check wiring»");
   return false;
 }
 
@@ -1104,7 +1163,7 @@ void radioHealthGuard() {
   lastReinit = millis();
 
   Serial.println("CC1101 nie odpowiada po SPI - reinicjalizacja radia");
-  logEventS(LOG_ERROR, "CC1101 nie odpowiada po SPI - reinicjalizacja");
+  logEventS(LOG_ERROR, "«CC1101 nie odpowiada po SPI - reinicjalizacja|CC1101 not responding over SPI - reinitialising»");
   statRadioReinit++;
   ccInitBase();
   applyVevorMode();
@@ -1148,7 +1207,7 @@ void loopVevor() {
         Serial.print(ms, HEX);
         Serial.println(") - restart odbioru");
         statRxRestarts++;
-        logEventS(LOG_WARN, "Radio nie odbiera (MARCSTATE=0x" + String(ms, HEX) + ") - restart");
+        logEventS(LOG_WARN, "«Radio nie odbiera|Radio not receiving» (MARCSTATE=0x" + String(ms, HEX) + ") - «restart|restart»");
         ccStartRx();
       }
     }
@@ -1748,10 +1807,10 @@ void mqttPubDiscoveryAll() {
   mqttPubDiscovery("temperature",    "Temperatura",        "°C",   "temperature",     (p + "/temperature").c_str());
   mqttPubDiscovery("humidity",       "Wilgotnosc",         "%",    "humidity",        (p + "/humidity").c_str());
   mqttPubDiscovery("wind_speed",     "Wiatr",              "m/s",  "wind_speed",      (p + "/wind_speed").c_str());
-  mqttPubDiscovery("wind_gust",      "Wiatr (poryw) / Wind (gust)",      "m/s",  "wind_speed",      (p + "/wind_gust").c_str());
-  mqttPubDiscovery("wind_direction", "Kierunek wiatru / Wind direction",    "°",    "",                (p + "/wind_direction").c_str());
+  mqttPubDiscovery("wind_gust",      "«Wiatr (poryw)|Wind (gust)»",      "m/s",  "wind_speed",      (p + "/wind_gust").c_str());
+  mqttPubDiscovery("wind_direction", "«Kierunek wiatru|Wind direction»",    "°",    "",                (p + "/wind_direction").c_str());
   mqttPubDiscovery("rain",           "Opad",               "mm",   "",                (p + "/rain").c_str());
-  mqttPubDiscovery("uv_index",       "Indeks UV / UV index",          "UVI",  "",                (p + "/uv_index").c_str());
+  mqttPubDiscovery("uv_index",       "«Indeks UV|UV index»",          "UVI",  "",                (p + "/uv_index").c_str());
   mqttPubDiscovery("light",          "Swiatlo",            "lx",   "illuminance",     (p + "/light").c_str());
   mqttPubDiscovery("rssi",           "RSSI",               "dBm",  "signal_strength", (p + "/rssi").c_str());
 }
@@ -2191,44 +2250,105 @@ void handleRoot() {
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-           background: #1a1a2e; color: #eee; padding: 16px; }
-    h1 { color: #00d9ff; margin-bottom: 10px; font-size: 1.3em; }
-    .stats { background: #16213e; padding: 14px; border-radius: 8px;
-             margin-bottom: 16px; display: flex; gap: 24px; flex-wrap: wrap; }
+           background: #f2f5f9; color: #1f2937; margin: 0; }
+    .layout { display: flex; min-height: 100vh; }
+
+    /* --- Menu po lewej --- */
+    .sidebar { width: 208px; flex: 0 0 208px; background: #ffffff;
+               border-right: 1px solid #dbe3ec; padding: 14px 10px;
+               position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+    .brand { font-size: 1.02em; font-weight: 700; color: #0369a1;
+             padding: 4px 8px 12px 8px; border-bottom: 1px solid #eef2f7; margin-bottom: 10px; }
+    .navbtn { display: block; padding: 9px 10px; margin-bottom: 3px; border-radius: 8px;
+              color: #334155; text-decoration: none; font-size: 0.9em; }
+    .navbtn:hover { background: #eef6ff; color: #0369a1; }
+    .navbtn.active { background: #e0f0ff; color: #0369a1; font-weight: 600; }
+    .navbtn.danger { color: #b91c1c; }
+    .navbtn.danger:hover { background: #fee2e2; }
+    .navsep { height: 1px; background: #eef2f7; margin: 9px 4px; }
+    .langbox { padding: 8px; font-size: 0.85em; color: #64748b; }
+    .langbox a { text-decoration: none; font-size: 1.15em; margin-right: 6px; }
+
+    /* --- Tresc --- */
+    .content { flex: 1; padding: 16px 20px; min-width: 0; }
+    .topbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+    .chip { background: #ffffff; border: 1px solid #dbe3ec; border-radius: 999px;
+            padding: 6px 13px; font-size: 0.83em; color: #334155; white-space: nowrap; }
+    .chip b { color: #0f172a; }
+    .chip .dot { font-size: 0.9em; }
+    .ok   { color: #15803d; }
+    .bad  { color: #b91c1c; }
+    .warn { color: #b45309; }
+    .chip.ok  { border-color: #bbf7d0; background: #f0fdf4; color: #15803d; }
+    .chip.bad { border-color: #fecaca; background: #fef2f2; color: #b91c1c; }
+    .chip.warn{ border-color: #fde68a; background: #fffbeb; color: #b45309; }
+
+    h2 { color: #0369a1; margin: 20px 0 8px; font-size: 1.05em; }
+    h2:first-child { margin-top: 0; }
+    .stats { background: #ffffff; border: 1px solid #dbe3ec; padding: 14px 16px;
+             border-radius: 10px; margin-bottom: 16px;
+             display: flex; gap: 26px; flex-wrap: wrap; }
     .stat { text-align: center; }
-    .stat-value { font-size: 1.6em; color: #00d9ff; font-weight: bold; }
-    .stat-label { color: #888; font-size: 0.85em; }
-    h2 { color: #00d9ff; margin: 16px 0 8px; font-size: 1.1em; }
-    table { width: 100%; border-collapse: collapse; background: #16213e;
-            border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
-    th { background: #0f3460; color: #00d9ff; padding: 8px; text-align: left; font-size: 0.8em; }
-    td { padding: 7px 8px; border-bottom: 1px solid #0f3460; font-size: 0.8em; }
-    tr:hover { background: #1f4068; }
-    .hex { font-family: monospace; font-size: 0.7em; color: #9ad0ff;
+    .stat-value { font-size: 1.45em; color: #0369a1; font-weight: 700; }
+    .stat-label { color: #64748b; font-size: 0.8em; }
+    .card { background: #ffffff; border: 1px solid #dbe3ec; border-radius: 10px;
+            padding: 14px; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; background: #ffffff;
+            border: 1px solid #dbe3ec; border-radius: 10px; overflow: hidden; margin-bottom: 12px; }
+    th { background: #f8fafc; color: #0369a1; padding: 9px 10px; text-align: left;
+         font-size: 0.79em; text-transform: uppercase; letter-spacing: 0.03em;
+         border-bottom: 1px solid #e2e8f0; }
+    td { padding: 8px 10px; border-bottom: 1px solid #f1f5f9; font-size: 0.85em; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #f8fbff; }
+    .hex { font-family: ui-monospace, Consolas, monospace; font-size: 0.72em; color: #0369a1;
            word-break: break-all; max-width: 420px; }
-    .rssi { color: #6bcb77; }
-    .hit { color: #00ff88; font-weight: bold; }
-    .zero { color: #444; }
-    .mono { font-family: monospace; }
+    .rssi { color: #15803d; }
+    .hit { color: #15803d; font-weight: 700; }
+    .zero { color: #cbd5e1; }
+    .mono { font-family: ui-monospace, Consolas, monospace; }
+
+    /* --- Telefony: menu na gore --- */
+    @media (max-width: 760px) {
+      .layout { flex-direction: column; }
+      .sidebar { width: 100%; flex: none; height: auto; position: static;
+                 border-right: none; border-bottom: 1px solid #dbe3ec; }
+      .content { padding: 14px; }
+    }
   </style>
 </head>
 <body>
-  <h1>📡 868 MHz — odbiornik stacji pogodowych / weather station receiver</h1>
-  <div style="margin-bottom:12px">
-    <a href="/" style="color:#00d9ff;margin-right:14px;text-decoration:none">📡 Odczyt / Reading</a>
-    <a href="/setup" style="color:#00d9ff;margin-right:14px;text-decoration:none">⚙️ Ustawienia / Settings</a>
-    <a href="/cal" style="color:#00d9ff;margin-right:14px;text-decoration:none">📐 Kalibracja / Calibration</a>
-    <a href="/send" style="color:#00d9ff;margin-right:14px;text-decoration:none">📤 Wysyłanie / Sending</a>
-    <a href="/mqtt" style="color:#00d9ff;margin-right:14px;text-decoration:none">🔌 MQTT</a>
-    <a href="/log" style="color:#00d9ff;margin-right:14px;text-decoration:none">📋 Log</a>
-    <a href="/errors" style="color:#00d9ff;margin-right:14px;text-decoration:none">🚨 Błędy / Errors</a>
-    <a href="/status" style="color:#00d9ff;margin-right:14px;text-decoration:none">🩺 Status JSON</a>
-    <a href="/update" style="color:#00d9ff;margin-right:14px;text-decoration:none">⬆️ OTA</a>
-    <a href="/json" style="color:#00d9ff;margin-right:14px;text-decoration:none">JSON</a>
-    <a href="/reboot" style="color:#ffb84d;margin-right:14px;text-decoration:none">♻️ Restart</a>
-    <a href="/clear" style="color:#ff6b6b;text-decoration:none">Wyczyść / Clear</a>
-  </div>
-  <div class="stats">
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">📡 868 MHz</div>
+    <a class="navbtn active" href="/">📡 «Odczyt|Reading»</a>
+    <a class="navbtn" href="/setup">⚙️ «Ustawienia|Settings»</a>
+    <a class="navbtn" href="/cal">📐 «Kalibracja|Calibration»</a>
+    <a class="navbtn" href="/send">📤 «Wysyłanie|Sending»</a>
+    <a class="navbtn" href="/mqtt">🔌 MQTT</a>
+    <div class="navsep"></div>
+    <a class="navbtn" href="/log">📋 «Log|Log»</a>
+    <a class="navbtn" href="/errors">🚨 «Błędy|Errors»</a>
+    <a class="navbtn" href="/status">🩺 Status JSON</a>
+    <a class="navbtn" href="/json">JSON</a>
+    <a class="navbtn" href="/update">⬆️ «Aktualizacja|Firmware update»</a>
+    <div class="navsep"></div>
+    <a class="navbtn" href="/reboot">♻️ «Restart|Restart»</a>
+    <a class="navbtn danger" href="/clear">🗑 «Wyczyść dane|Clear data»</a>
+    <div class="langbox">🌐 «Język|Language»:<br><a href="#" onclick="setLang('pl');return false" id="l-pl">🇵🇱 PL</a><a href="#" onclick="setLang('en');return false" id="l-en">🇬🇧 EN</a></div>
+  </aside>
+
+  <main class="content">
+    <div class="topbar">
+      <span class="chip" id="tb-wifi">📶 WiFi: <b>—</b></span>
+      <span class="chip" id="tb-ip">🌐 IP: <b>—</b></span>
+      <span class="chip" id="tb-mqtt">🔌 MQTT: <b>—</b></span>
+      <span class="chip" id="tb-radio">📻 «Radio|Radio»: <b>—</b></span>
+      <span class="chip" id="tb-station">🛰 «Stacja|Station»: <b>—</b></span>
+      <span class="chip" id="tb-frames">📦 «Ramki|Frames»: <b>—</b></span>
+      <span class="chip" id="tb-up">⏱ «Czas pracy|Uptime»: <b>—</b></span>
+      <span class="chip" id="tb-heap">💾 RAM: <b>—</b></span>
+    </div>
     <div class="stat">
       <div class="stat-value mono" style="color:#ff6b6b">)";
   html += (rxMode == MODE_FINE_OFFSET)
@@ -2243,7 +2363,7 @@ void handleRoot() {
                     ? "868.30 / FSK_8k"
                     : String(FREQ_NAMES[currentFreq]) + " / " + String(PROF_NAMES[currentProf]);
   html += R"(</div>
-      <div class="stat-label">Aktualna kombinacja / Current setting</div>
+      <div class="stat-label">«Aktualna kombinacja|Current setting»</div>
     </div>
     <div class="stat">
       <div class="stat-value" style="color:#c084fc">)";
@@ -2254,31 +2374,31 @@ void handleRoot() {
         : (rxMode == MODE_BRESSER) ? "Bresser 5/6/7-in-1"
         : "Skan raw";
   html += R"(</div>
-      <div class="stat-label">Tryb odbioru / RX mode</div>
+      <div class="stat-label">«Tryb odbioru|RX mode»</div>
     </div>
     <div class="stat">
       <div class="stat-value" id="stat-frames">)";
   html += String(totalFrames);
   html += R"(</div>
-      <div class="stat-label">Ramek (wszystkie) / Frames (all)</div>
+      <div class="stat-label">«Ramek (wszystkie)|Frames (all)»</div>
     </div>
     <div class="stat">
       <div class="stat-value" style="color:#6bcb77" id="stat-accepted">)";
   html += String(acceptedFrames);
   html += R"(</div>
-      <div class="stat-label">Zapisane / Stored</div>
+      <div class="stat-label">«Zapisane|Stored»</div>
     </div>
     <div class="stat">
       <div class="stat-value" style="color:#ffb84d" id="stat-rejected">)";
   html += String(rejectedFrames);
   html += R"(</div>
-      <div class="stat-label">Odrzucone (filtr) / Rejected (filter)</div>
+      <div class="stat-label">«Odrzucone (filtr)|Rejected (filter)»</div>
     </div>
     <div class="stat">
       <div class="stat-value" id="stat-uptime">)";
   html += String((millis() - startTime) / 1000);
   html += R"(s</div>
-      <div class="stat-label">Uptime / Czas pracy</div>
+      <div class="stat-label">«Uptime|Czas pracy»</div>
     </div>
     <div class="stat">
       <div class="stat-value">)";
@@ -2325,7 +2445,7 @@ void handleRoot() {
   }
 
   // --- Sekcja danych pogodowych (dekoder) ---
-  html += R"(<h2>Dane pogodowe (dekoder) / Weather data (decoder)</h2>)";
+  html += R"(<h2>«Dane pogodowe (dekoder)|Weather data (decoder)»</h2>)";
 
   if (rxMode == MODE_RAW_SCAN) {
     html += R"(<div style="background:#16213e;padding:14px;border-radius:8px;color:#888">
@@ -2362,38 +2482,38 @@ void handleRoot() {
   } else {
     const WeatherData& w = lastWeatherCal;   // wartości po kalibracji
     html += R"(<table id="weather-table">
-      <tr><th>Parametr / Parameter</th><th>Wartość / Value</th></tr>)";
-    html += "<tr><td>Model / rodzina (Model / family)</td><td class='mono' id='w-model'>" + w.model + "</td></tr>";
-    html += "<tr><td>ID nadajnika / Transmitter ID</td><td class='mono' id='w-id'>" + String(w.id) + "</td></tr>";
-    html += "<tr><td>Bateria / Battery</td><td id='w-battery'>" + String(w.batteryOk ? "OK" : "SLABA") + "</td></tr>";
+      <tr><th>«Parametr|Parameter»</th><th>«Wartość|Value»</th></tr>)";
+    html += "<tr><td>«Model / rodzina|Model / family»</td><td class='mono' id='w-model'>" + w.model + "</td></tr>";
+    html += "<tr><td>«ID nadajnika|Transmitter ID»</td><td class='mono' id='w-id'>" + String(w.id) + "</td></tr>";
+    html += "<tr><td>«Bateria|Battery»</td><td id='w-battery'>" + String(w.batteryOk ? "OK" : "SLABA") + "</td></tr>";
     if (w.haveTemp)
-      html += "<tr><td>Temperatura / Temperature</td><td id='w-temp'>" + String(w.tempC, 1) + " &deg;C</td></tr>";
+      html += "<tr><td>«Temperatura|Temperature»</td><td id='w-temp'>" + String(w.tempC, 1) + " &deg;C</td></tr>";
     if (w.haveHum)
-      html += "<tr><td>Wilgotność / Humidity</td><td id='w-hum'>" + String(w.humidity) + " %</td></tr>";
+      html += "<tr><td>«Wilgotność|Humidity»</td><td id='w-hum'>" + String(w.humidity) + " %</td></tr>";
     if (w.haveWind)
-      html += "<tr><td>Wiatr (średni) / Wind (avg)</td><td id='w-wind'>" + String(w.windAvgMs, 1) + " m/s (" + String(w.windAvgMs * 3.6f, 1) + " km/h)</td></tr>";
+      html += "<tr><td>«Wiatr (średni)|Wind (avg)»</td><td id='w-wind'>" + String(w.windAvgMs, 1) + " m/s (" + String(w.windAvgMs * 3.6f, 1) + " km/h)</td></tr>";
     if (w.haveGust)
-      html += "<tr><td>Wiatr (poryw) / Wind (gust)</td><td id='w-gust'>" + String(w.windMaxMs, 1) + " m/s (" + String(w.windMaxMs * 3.6f, 1) + " km/h)</td></tr>";
+      html += "<tr><td>«Wiatr (poryw)|Wind (gust)»</td><td id='w-gust'>" + String(w.windMaxMs, 1) + " m/s (" + String(w.windMaxMs * 3.6f, 1) + " km/h)</td></tr>";
     if (w.haveWindDir)
-      html += "<tr><td>Kierunek wiatru / Wind direction</td><td id='w-dir'>" + String(w.windDirDeg) + "&deg; (" + String(windDirText(w.windDirDeg)) + ")</td></tr>";
+      html += "<tr><td>«Kierunek wiatru|Wind direction»</td><td id='w-dir'>" + String(w.windDirDeg) + "&deg; (" + String(windDirText(w.windDirDeg)) + ")</td></tr>";
     if (w.haveRain)
-      html += "<tr><td>Opad (od włączenia) / Rain (since start)</td><td id='w-rain'>" + String(w.rainMm, 1) + " mm</td></tr>";
+      html += "<tr><td>«Opad (od włączenia)|Rain (since start)»</td><td id='w-rain'>" + String(w.rainMm, 1) + " mm</td></tr>";
     if (w.haveUv)
-      html += "<tr><td>Indeks UV / UV index</td><td id='w-uv'>" + String(w.uvi) + "</td></tr>";
+      html += "<tr><td>«Indeks UV|UV index»</td><td id='w-uv'>" + String(w.uvi) + "</td></tr>";
     if (w.haveLight) {
       if (w.model == "Vevor-YT60309")
-        html += "<tr><td>Światło / Light</td><td id='w-light'>" + String(w.lightLux, 0) + " W/m²</td></tr>";
+        html += "<tr><td>«Światło|Light»</td><td id='w-light'>" + String(w.lightLux, 0) + " W/m²</td></tr>";
       else
-        html += "<tr><td>Światło / Light</td><td id='w-light'>" + String(w.lightLux, 0) + " lux (" + String(w.lightLux / 1000.0f, 2) + " k lux)</td></tr>";
+        html += "<tr><td>«Światło|Light»</td><td id='w-light'>" + String(w.lightLux, 0) + " lux (" + String(w.lightLux / 1000.0f, 2) + " k lux)</td></tr>";
     }
     html += "<tr><td>RSSI</td><td id='w-rssi'>" + String(w.rssi) + " dBm</td></tr>";
-    html += "<tr><td>Ostatni pakiet / Last packet</td><td class='hex' id='w-hex'>" + lastDecodedHex + "</td></tr>";
+    html += "<tr><td>«Ostatni pakiet|Last packet»</td><td class='hex' id='w-hex'>" + lastDecodedHex + "</td></tr>";
     html += R"(</table>)";
   }
 
-  // --- Diagnostyka odbioru / Reception diagnostics (tylko w trybach dekodera) ---
+  // --- «Diagnostyka odbioru|Reception diagnostics» (tylko w trybach dekodera) ---
   if (rxMode != MODE_RAW_SCAN) {
-    html += R"(<h2>Diagnostyka odbioru / Reception diagnostics</h2>
+    html += R"(<h2>«Diagnostyka odbioru|Reception diagnostics»</h2>
     <div style="background:#16213e;padding:14px;border-radius:8px;margin-bottom:12px;color:#bbb">
       Pakiety z poprawnym sync word: <b style="color:#00d9ff">)";
     html += String(diagTotal);
@@ -2414,7 +2534,7 @@ void handleRoot() {
       </div>)";
     } else {
       html += R"(<table>
-        <tr><th>Czas / Time</th><th>RSSI</th><th>Długość / Length</th><th>Status</th><th>Hex</th></tr>)";
+        <tr><th>«Czas|Time»</th><th>RSSI</th><th>«Długość|Length»</th><th>Status</th><th>Hex</th></tr>)";
       int showD = diagCount < MAX_DIAG ? diagCount : MAX_DIAG;
       for (int i = 0; i < showD; i++) {
         int idx = (diagHead - showD + i + MAX_DIAG) % MAX_DIAG;
@@ -2489,7 +2609,7 @@ void handleRoot() {
   html += String(MAX_SHOW_FRAMES);
   html += R"( )</h2>
   <table>
-    <tr><th>Czas / Time</th><th>MHz</th><th>Profil</th><th>RSSI</th><th>Len</th><th>Hex</th></tr>)";
+    <tr><th>«Czas|Time»</th><th>MHz</th><th>Profil</th><th>RSSI</th><th>Len</th><th>Hex</th></tr>)";
 
   int show = frameCount < MAX_SHOW_FRAMES ? frameCount : MAX_SHOW_FRAMES;
   for (int i = 0; i < show; i++) {
@@ -2509,7 +2629,7 @@ void handleRoot() {
   </table>)";
   }  // koniec sekcji skanera surowego
 
-  html += R"(<p style="margin-top:12px; color:#6bcb77; font-size:0.9em;">Filtr ramek / Frame filter: )";
+  html += R"(<p style="margin-top:12px; color:#6bcb77; font-size:0.9em;">«Filtr ramek|Frame filter»: )";
   html += filterCfg.enabled ? "WŁĄCZONY" : "WYŁĄCZONY";
   if (filterCfg.enabled) {
     html += " — wzorzec: ";
@@ -2533,42 +2653,42 @@ void handleRoot() {
   </p>)";
   }
 
-  // --- Diagnostyka systemu / System diagnostics: zdarzenia, restarty, watchdog ---
-  html += R"(<h2>Diagnostyka systemu / System diagnostics</h2>
+  // --- «Diagnostyka systemu|System diagnostics»: zdarzenia, restarty, watchdog ---
+  html += R"(<h2>«Diagnostyka systemu|System diagnostics»</h2>
   <div style="background:#16213e;padding:14px;border-radius:8px;margin-bottom:12px;color:#bbb;font-size:0.85em">
-    Powód restartu / Reset reason: <b style="color:)";
+    «Powód restartu|Reset reason»: <b style="color:)";
   bool badReset = (bootResetReason == ESP_RST_BROWNOUT || bootResetReason == ESP_RST_PANIC ||
                    bootResetReason == ESP_RST_TASK_WDT || bootResetReason == ESP_RST_INT_WDT ||
                    bootResetReason == ESP_RST_WDT);
   html += badReset ? "#ff6b6b" : "#6bcb77";
   html += R"(" id="sys-reset">)";
   html += String(resetReasonText(bootResetReason));
-  html += R"(</b> &nbsp;|&nbsp; Startów / Boots: <b id="sys-boots">)";
+  html += R"(</b> &nbsp;|&nbsp; «Startów|Boots»: <b id="sys-boots">)";
   html += String(rtcBootCount);
   html += R"(</b> &nbsp;|&nbsp; Watchdog: <b id="sys-wdt">)";
   html += wdtEnabled ? "włączony (30 s)" : "WYŁĄCZONY";
-  html += R"(</b> &nbsp;|&nbsp; Restarty WDT / WDT resets: <b style="color:#ff6b6b">)";
+  html += R"(</b> &nbsp;|&nbsp; «Restarty WDT|WDT resets»: <b style="color:#ff6b6b">)";
   html += String(rtcWdtResets);
   html += R"(</b> &nbsp;|&nbsp; Brownout: <b style="color:#ffb84d">)";
   html += String(rtcBrownouts);
   html += R"(</b> &nbsp;|&nbsp; Crash: <b style="color:#ffb84d">)";
   html += String(rtcPanics);
   html += R"(</b><br>
-    Wolna RAM / Free RAM: <b id="sys-heap">)";
+    «Wolna RAM|Free RAM»: <b id="sys-heap">)";
   html += String(ESP.getFreeHeap());
-  html += R"(</b> B &nbsp;|&nbsp; Najdłuższe loop() / Max loop(): <b id="sys-maxloop">)";
+  html += R"(</b> B &nbsp;|&nbsp; «Najdłuższe loop()|Max loop()»: <b id="sys-maxloop">)";
   html += String(statMaxLoopMs);
-  html += R"(</b> ms &nbsp;|&nbsp; Reinicjalizacje radia / Radio reinits: <b id="sys-reinit">)";
+  html += R"(</b> ms &nbsp;|&nbsp; «Reinicjalizacje radia|Radio reinits»: <b id="sys-reinit">)";
   html += String(statRadioReinit);
-  html += R"(</b> &nbsp;|&nbsp; Restarty odbioru / RX restarts: <b id="sys-rxrestart">)";
+  html += R"(</b> &nbsp;|&nbsp; «Restarty odbioru|RX restarts»: <b id="sys-rxrestart">)";
   html += String(statRxRestarts);
-  html += R"(</b> &nbsp;|&nbsp; Cykle / Cycles: <b id="sys-loops">)";
+  html += R"(</b> &nbsp;|&nbsp; «Cykle|Cycles»: <b id="sys-loops">)";
   html += String(statLoopCount);
   html += R"(</b>
   </div>)";
 
   html += R"(<table>
-    <tr><th>Czas / Time</th><th>Poziom / Level</th><th>Zdarzenie / Event</th></tr>)";
+    <tr><th>«Czas|Time»</th><th>«Poziom|Level»</th><th>«Zdarzenie|Event»</th></tr>)";
   if (logCount == 0) {
     html += R"(<tr><td colspan="3" style="color:#666">(brak zdarzeń)</td></tr>)";
   } else {
@@ -2582,10 +2702,10 @@ void handleRoot() {
     }
   }
   html += R"(</table>
-  <p style="color:#666;font-size:0.85em">Pełny raport / Full report: <a href="/log" style="color:#00d9ff">/log</a>
-  &nbsp;|&nbsp; Plik błędów / Error file: <a href="/errors" style="color:#00d9ff">/errors</a>
+  <p style="color:#666;font-size:0.85em">«Pełny raport|Full report»: <a href="/log" style="color:#00d9ff">/log</a>
+  &nbsp;|&nbsp; «Plik błędów|Error file»: <a href="/errors" style="color:#00d9ff">/errors</a>
   &nbsp;|&nbsp; JSON: <a href="/status" style="color:#00d9ff">/status</a>
-  &nbsp;|&nbsp; Zdalny restart / Remote reboot: <a href="/reboot" style="color:#ffb84d">/reboot</a></p>)";
+  &nbsp;|&nbsp; «Zdalny restart|Remote reboot»: <a href="/reboot" style="color:#ffb84d">/reboot</a></p>)";
 
   html += R"(
 <script>
@@ -2636,7 +2756,13 @@ function refresh() {
 }
 setInterval(refresh, 3000);
 
-// Statystyki systemu (restarty, watchdog, RAM) z /status.
+// Statystyki systemu (restarty, watchdog, RAM) z /status + pasek statusu na górze.
+function chip(id, text, cls) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.innerHTML = text;
+  el.className = 'chip' + (cls ? ' ' + cls : '');
+}
 function refreshSys() {
   fetch('/status')
     .then(function(r) { return r.json(); })
@@ -2654,11 +2780,38 @@ function refreshSys() {
                         ' | WDT: ' + s.wdtResets + ' | brownout: ' + s.brownouts +
                         ' | crash: ' + s.panics;
       }
+      // --- Pasek statusu na górze ---
+      chip('tb-wifi', '📶 WiFi: <b>' + L('połączone','connected') + '</b>',
+           s.wifiConnected ? 'ok' : 'bad');
+      chip('tb-ip', '🌐 IP: <b>' + (s.wifiIp || '—') + '</b>', s.wifiIp ? 'ok' : 'warn');
+      chip('tb-mqtt', '🔌 MQTT: <b>' + L('wyłączony','disabled') + '</b>', '');
+      if (s.mqttEnabled) {
+        chip('tb-mqtt', '🔌 MQTT: <b>' + L('połączony','connected') + '</b>', 'ok');
+        if (!s.mqttConnected)
+          chip('tb-mqtt', '🔌 MQTT: <b>' + L('rozłączony','disconnected') + '</b>', 'bad');
+      }
+      chip('tb-radio', '📻 ' + L('Radio','Radio') + ': <b>' + (s.radioOk ? 'OK' : L('BŁĄD','ERROR')) + '</b>',
+           s.radioOk ? 'ok' : 'bad');
+      chip('tb-station', '🛰 ' + L('Stacja','Station') + ': <b>' +
+           (s.lastDataAgeSec < 0 ? L('brak danych','no data') : (s.lastDataAgeSec + ' s ' + L('temu','ago'))) + '</b>',
+           s.lastDataAgeSec < 0 ? 'warn' : (s.lastDataAgeSec < 60 ? 'ok' : 'warn'));
+      chip('tb-frames', '📦 ' + L('Ramki','Frames') + ': <b>' + s.frames + '</b> (OK ' + s.accepted + ')', '');
+      chip('tb-up', '⏱ ' + L('Czas pracy','Uptime') + ': <b>' + Math.floor(s.uptime / 60) + ' min</b>', '');
+      chip('tb-heap', '💾 RAM: <b>' + Math.round(s.freeHeap / 1024) + ' kB</b>',
+           s.freeHeap < 40000 ? 'warn' : '');
+      setText('stat-rssi', s.rssi + ' dBm');
     })
     .catch(function() {});
 }
-setInterval(refreshSys, 10000);
+window.__reloadText = refreshSys;
+setInterval(refreshSys, 5000);
+refreshSys();
 </script>
+)";
+  html += langScript();
+  html += R"(
+  </main>
+</div>
 </body>
 </html>)";
 
@@ -2912,7 +3065,7 @@ void handleSetup() {
   </style>
 </head>
 <body>
-  <h1>Konfiguracja / Configuration</h1>
+  <h1>«Konfiguracja|Configuration»</h1>
   <div style="margin-bottom:14px">
     <a href="/">📡 Odczyt</a>
     <a href="/setup">⚙️ Ustawienia</a>
@@ -2925,22 +3078,22 @@ void handleSetup() {
   <form method="post" action="/save">
     <div class="card">
       <h2>Punkt dostepowy AP / Access point (AP) - zawsze aktywny / always on</h2>
-      <label>Nazwa sieci AP / AP SSID</label>
+      <label>«Nazwa sieci AP|AP SSID»</label>
       <input type="text" name="apSsid" value=")";
   h += htmlEscape(wifiCfg.apSsid);
   h += R"(">
-      <label>Haslo AP / AP password (min. 8 znakow / chars)</label>
+      <label>«Haslo AP (min. 8 znakow)|AP password (min. 8 chars)»</label>
       <input type="text" name="apPass" value=")";
   h += htmlEscape(wifiCfg.apPass);
   h += R"(">
     </div>
     <div class="card">
       <h2>Sieć kliencka / Client network (STA)</h2>
-      <label>SSID sieci Wi-Fi / Wi-Fi SSID</label>
+      <label>«SSID sieci Wi-Fi|Wi-Fi SSID»</label>
       <input type="text" name="ssid" value=")";
   h += htmlEscape(wifiCfg.staSsid);
   h += R"(">
-      <label>Haslo sieci Wi-Fi / Wi-Fi password</label>
+      <label>«Haslo sieci Wi-Fi|Wi-Fi password»</label>
       <input type="password" name="pass" value=")";
   h += htmlEscape(wifiCfg.staPass);
   h += R"(">
@@ -2951,13 +3104,13 @@ void handleSetup() {
         <label for="staticip">Uzyj stalego adresu IP</label>
       </div>
       <div class="grid">
-        <div><label>Adres IP / IP address</label><input type="text" name="ip" value=")";
+        <div><label>«Adres IP|IP address»</label><input type="text" name="ip" value=")";
   h += htmlEscape(wifiCfg.ip);
   h += R"("></div>
-        <div><label>Maska / Netmask</label><input type="text" name="mask" value=")";
+        <div><label>«Maska|Netmask»</label><input type="text" name="mask" value=")";
   h += htmlEscape(wifiCfg.mask);
   h += R"("></div>
-        <div><label>Brama / Gateway</label><input type="text" name="gw" value=")";
+        <div><label>«Brama|Gateway»</label><input type="text" name="gw" value=")";
   h += htmlEscape(wifiCfg.gw);
   h += R"("></div>
         <div><label>DNS</label><input type="text" name="dns" value=")";
@@ -2967,8 +3120,8 @@ void handleSetup() {
       <div class="hint">Staly adres IP dziala tylko w sieci klienckiej (STA). Gdy opcja jest odznaczona, uzywane jest DHCP.</div>
     </div>
     <div class="card">
-      <h2>Tryb odbioru / RX mode</h2>
-      <label>Tryb pracy radia / Radio mode</label>
+      <h2>«Tryb odbioru|RX mode»</h2>
+      <label>«Tryb pracy radia|Radio mode»</label>
       <select name="rxMode" style="width:100%;max-width:420px;padding:8px;border-radius:6px;border:1px solid #0f3460;background:#0f1b3d;color:#eee;font-size:0.95em">
         <option value="raw" )";
   h += (rxMode == MODE_RAW_SCAN) ? "selected" : "";
@@ -2999,25 +3152,25 @@ void handleSetup() {
   h += R"(>
         <label for="filtEn">Wlacz filtr (zapisuj tylko pasujace ramki)</label>
       </div>
-      <label>Wzorzec hex / Hex pattern (np. ID urzadzenia / e.g. device ID)</label>
+      <label>«Wzorzec hex (np. ID urzadzenia)|Hex pattern (e.g. device ID)»</label>
       <input type="text" name="filtPat" value=")";
   h += htmlEscape(filterCfg.pattern);
   h += R"(">
       <div class="hint">Pusty wzorzec = filtruj tylko po dlugosci ramki. Hex, spacje myslniki dozwolone.</div>
       <div class="grid">
-        <div><label>Offset (bajt startu / start byte)</label><input type="number" name="filtOff" value=")";
+        <div><label>«Offset (bajt startu)|Offset (start byte)»</label><input type="number" name="filtOff" value=")";
   h += String(filterCfg.offset);
   h += R"("></div>
-        <div><label>Min. dlugosc / Min length</label><input type="number" name="filtMin" value=")";
+        <div><label>«Min. dlugosc|Min length»</label><input type="number" name="filtMin" value=")";
   h += String(filterCfg.minLen);
   h += R"("></div>
-        <div><label>Max. dlugosc / Max length (0=bez / none)</label><input type="number" name="filtMax" value=")";
+        <div><label>«Max. dlugosc (0=bez)|Max length (0=none)»</label><input type="number" name="filtMax" value=")";
   h += String(filterCfg.maxLen);
   h += R"("></div>
       </div>
       <div class="hint">Offset -1 = szukaj wzorca w calej ramce. Offset >= 0 = wzorzec musi byc dokladnie na tym bajcie (liczac od 0).</div>
     </div>
-    <button type="submit">Zapisz i zastosuj / Save and apply</button>
+    <button type="submit">«Zapisz i zastosuj|Save and apply»</button>
   </form>
   <p style="margin-top:14px; color:#666; font-size:0.85em">
     Po zapisaniu urzadzenie przełączy sieć. Punkt dostepowy dziala zawsze - domyslnie pod adresem 192.168.4.1.
@@ -3047,7 +3200,7 @@ void handleSave() {
   filterCfg.maxLen = server.hasArg("filtMax") ? server.arg("filtMax").toInt() : 0;
   saveFilterCfg();
 
-  // Tryb odbioru / RX mode
+  // «Tryb odbioru|RX mode»
   RxMode newMode = MODE_RAW_SCAN;
   if (server.arg("rxMode") == "fo") newMode = MODE_FINE_OFFSET;
   else if (server.arg("rxMode") == "vevor") newMode = MODE_VEVOR_7IN1;
@@ -3151,14 +3304,22 @@ String cfgPageStart(const String& title, const String& h1) {
   h += h1;
   h += R"(</h1>
   <div style="margin-bottom:12px">
-    <a href="/">📡 Odczyt</a>
-    <a href="/setup">⚙️ Ustawienia</a>
-    <a href="/cal">📐 Kalibracja</a>
-    <a href="/send">📤 Wysyłanie</a>
+    <a href="/">📡 «Odczyt|Reading»</a>
+    <a href="/setup">⚙️ «Ustawienia|Settings»</a>
+    <a href="/cal">📐 «Kalibracja|Calibration»</a>
+    <a href="/send">📤 «Wysyłanie|Sending»</a>
     <a href="/mqtt">🔌 MQTT</a>
+    <a href="/log">📋 Log</a>
+    <a href="/errors">🚨 «Błędy|Errors»</a>
+    <a href="/status">🩺 JSON</a>
+    <a href="/update">⬆️ OTA</a>
     <a href="/json">JSON</a>
-    <a href="/clear" style="color:#ff6b6b">Wyczyść</a>
+    <a href="/clear" style="color:#ff6b6b">«Wyczyść|Clear»</a>
+    <span style="margin-left:14px">🌐 «Język|Language»: </span>)";
+  h += langBar();
+  h += R"(
   </div>)";
+  h += langScript();
   return h;
 }
 
@@ -3168,7 +3329,7 @@ String cfgPageEnd() {
 }
 
 void handleCal() {
-  String h = cfgPageStart("Kalibracja / Calibration - Weather Sniffer", "📐 Kalibracja czujników / Sensor calibration");
+  String h = cfgPageStart("«Kalibracja|Calibration» - Weather Sniffer", "📐 Kalibracja czujników / Sensor calibration");
   h += R"(<form method="post" action="/savecal">
     <div class="card">
       <h2>Korekta wskazan / Readings correction (po dekodowaniu / after decoding)</h2>
@@ -3177,27 +3338,27 @@ void handleCal() {
         <div><label>Temp. offset [°C]</label><input type="number" step="0.1" name="tempOffset" value=")";
   h += String(calCfg.tempOffset, 1);
   h += R"("></div>
-        <div><label>Wilgotnosc offset / Humidity offset [%]</label><input type="number" step="0.1" name="humOffset" value=")";
+        <div><label>«Wilgotnosc offset|Humidity offset»</label><input type="number" step="0.1" name="humOffset" value=")";
   h += String(calCfg.humOffset, 1);
   h += R"("></div>
-        <div><label>Wiatr x factor / Wind x factor</label><input type="number" step="0.01" name="windFactor" value=")";
+        <div><label>«Wiatr x factor|Wind x factor»</label><input type="number" step="0.01" name="windFactor" value=")";
   h += String(calCfg.windFactor, 3);
   h += R"("></div>
-        <div><label>Porywy x factor / Gust x factor</label><input type="number" step="0.01" name="gustFactor" value=")";
+        <div><label>«Porywy x factor|Gust x factor»</label><input type="number" step="0.01" name="gustFactor" value=")";
   h += String(calCfg.gustFactor, 3);
   h += R"("></div>
-        <div><label>Deszcz x factor / Rain x factor</label><input type="number" step="0.01" name="rainFactor" value=")";
+        <div><label>«Deszcz x factor|Rain x factor»</label><input type="number" step="0.01" name="rainFactor" value=")";
   h += String(calCfg.rainFactor, 3);
   h += R"("></div>
-        <div><label>Swiatlo x factor / Light x factor</label><input type="number" step="0.01" name="lightFactor" value=")";
+        <div><label>«Swiatlo x factor|Light x factor»</label><input type="number" step="0.01" name="lightFactor" value=")";
   h += String(calCfg.lightFactor, 3);
   h += R"("></div>
-        <div><label>Kierunek wiatru / Wind direction offset [°]</label><input type="number" name="windDirOffset" value=")";
+        <div><label>«Kierunek wiatru|Wind direction» offset [°]</label><input type="number" name="windDirOffset" value=")";
   h += String(calCfg.windDirOffset);
   h += R"("></div>
       </div>
     </div>
-    <button type="submit">Zapisz kalibracje / Save calibration</button>
+    <button type="submit">«Zapisz kalibracje|Save calibration»</button>
   </form>)";
   h += cfgPageEnd();
   server.send(200, "text/html", h);
@@ -3214,7 +3375,7 @@ void handleSend() {
   h += R"(>
         <label for="wifiEnabled">Włącz wysyłkę HTTP po każdym odbiorze</label>
       </div>
-      <label>Adres URL odbiorcy / Receiver URL</label>
+      <label>«Adres URL odbiorcy|Receiver URL»</label>
       <input type="text" name="targetUrl" value=")";
   h += htmlEscape(sendCfg.targetUrl);
   h += R"(">
@@ -3238,15 +3399,15 @@ void handleSend() {
         <div><label>Baud</label><input type="number" name="rs485Baud" value=")";
   h += String(sendCfg.rs485Baud);
   h += R"("></div>
-        <div><label>DE/RE pin (-1 = brak / none)</label><input type="number" name="rs485DePin" value=")";
+        <div><label>«DE/RE pin (-1 = brak)|DE/RE pin (-1 = none)»</label><input type="number" name="rs485DePin" value=")";
   h += String(sendCfg.rs485DePin);
   h += R"("></div>
       </div>
     </div>
-    <button type="submit">Zapisz wysylanie / Save sending</button>
+    <button type="submit">«Zapisz wysylanie|Save sending»</button>
   </form>
   <form method="post" action="/sendtest" style="margin-top:8px">
-    <button type="submit">Wyslij testowy pakiet / Send test packet</button>
+    <button type="submit">«Wyslij testowy pakiet|Send test packet»</button>
   </form>)";
   h += cfgPageEnd();
   server.send(200, "text/html", h);
@@ -3263,7 +3424,7 @@ void handleMqtt() {
   h += R"(>
         <label for="enabled">Włącz MQTT</label>
       </div>
-      <label>Adres brokera / Broker address</label>
+      <label>«Adres brokera|Broker address»</label>
       <input type="text" name="broker" value=")";
   h += htmlEscape(mqttCfg.broker);
   h += R"(">
@@ -3271,15 +3432,15 @@ void handleMqtt() {
       <input type="number" name="port" value=")";
   h += String(mqttCfg.port);
   h += R"(">
-      <label>Uzytkownik / User (opcjonalnie / optional)</label>
+      <label>«Uzytkownik (opcjonalnie)|User (optional)»</label>
       <input type="text" name="user" value=")";
   h += htmlEscape(mqttCfg.user);
   h += R"(">
-      <label>Haslo / Password (opcjonalnie / optional)</label>
+      <label>«Haslo (opcjonalnie)|Password (optional)»</label>
       <input type="password" name="pass" value=")";
   h += htmlEscape(mqttCfg.pass);
   h += R"(">
-      <label>Prefiks tematu / Topic prefix</label>
+      <label>«Prefiks tematu|Topic prefix»</label>
       <input type="text" name="topicPrefix" value=")";
   h += htmlEscape(mqttCfg.topicPrefix);
   h += R"(">
@@ -3290,7 +3451,7 @@ void handleMqtt() {
         <label for="haDiscovery">Publikuj auto-odkrycie Home Assistant</label>
       </div>
     </div>
-    <button type="submit">Zapisz MQTT / Save MQTT</button>
+    <button type="submit">«Zapisz MQTT|Save MQTT»</button>
   </form>)";
   h += cfgPageEnd();
   server.send(200, "text/html", h);
@@ -3307,7 +3468,7 @@ void handleSaveCal() {
   saveCalCfg();
   if (lastWeatherValid) lastWeatherCal = calibrateWeather(lastWeather);
 
-  String msg = cfgPageStart("Zapisano / Saved", "✅ Kalibracja zapisana / Calibration saved");
+  String msg = cfgPageStart("«Zapisano|Saved»", "✅ Kalibracja zapisana / Calibration saved");
   msg += R"(<div class="msg">Zapisano. <a href="/cal">Wróć do kalibracji</a> · <a href="/">Odczyt</a></div>)";
   msg += cfgPageEnd();
   server.send(200, "text/html", msg);
@@ -3324,7 +3485,7 @@ void handleSaveSend() {
   saveSendCfg();
   applySend();
 
-  String msg = cfgPageStart("Zapisano / Saved", "✅ Wysylanie zapisane / Sending saved");
+  String msg = cfgPageStart("«Zapisano|Saved»", "✅ Wysylanie zapisane / Sending saved");
   msg += R"(<div class="msg">Zapisano. <a href="/send">Wróć do wysyłania</a> · <a href="/">Odczyt</a></div>)";
   msg += cfgPageEnd();
   server.send(200, "text/html", msg);
@@ -3341,7 +3502,7 @@ void handleSaveMqtt() {
   saveMqttCfg();
   applyMqtt();
 
-  String msg = cfgPageStart("Zapisano / Saved", "✅ MQTT zapisane / MQTT saved");
+  String msg = cfgPageStart("«Zapisano|Saved»", "✅ MQTT zapisane / MQTT saved");
   msg += R"(<div class="msg">Zapisano. <a href="/mqtt">Wróć do MQTT</a> · <a href="/">Odczyt</a></div>)";
   msg += cfgPageEnd();
   server.send(200, "text/html", msg);
@@ -3889,12 +4050,12 @@ void handleSpiTest() {
 // `firmware.factory.bin` (ten zawiera bootloader + tablicę partycji).
 void handleOtaForm() {
   String h = "<html><meta charset='utf-8'><body style='font-family:sans-serif'>"
-             "<h2>Aktualizacja firmware / Firmware update (OTA)</h2>"
-             "<p>Wybierz plik / Choose file <b>firmware.bin</b> (sama aplikacja / application only, ~1,2 MB). "
+             "<h2>«Aktualizacja firmware|Firmware update (OTA)»</h2>"
+             "<p>«Wybierz plik|Choose file» <b>firmware.bin</b> (sama aplikacja / application only, ~1,2 MB). "
              "NIE uzywaj pliku factory.bin / Do NOT use factory.bin.</p>"
              "<form method='POST' action='/update' enctype='multipart/form-data'>"
              "<input type='file' name='fw' accept='.bin'> "
-             "<input type='submit' value='Wgraj i zrestartuj / Upload and restart'>"
+             "<input type='submit' value='«Wgraj i zrestartuj|Upload and restart»'>"
              "</form></body></html>";
   server.send(200, "text/html; charset=utf-8", h);
 }
@@ -3971,14 +4132,17 @@ String diagPageStart(const String& title, const String& subPl, const String& sub
   h += "<div class='sub'>" + subPl + "</div>";
   h += "<div class='alt'>" + subEn + "</div>";
   h += "<div class='nav'>"
-       "<a href='/'>📡 Odczyt / Main</a>"
+       "<a href='/'>📡 «Odczyt|Reading»</a>"
        "<a href='/log'>📋 Log</a>"
-       "<a href='/errors'>🚨 Błędy / Errors</a>"
+       "<a href='/errors'>🚨 «Błędy|Errors»</a>"
        "<a href='/status'>🩺 Status JSON</a>"
        "<a href='/update'>⬆️ OTA</a>"
-       "<a href='/log?raw=1'>⌨️ Log (tekst)</a>"
-       "<a href='/reboot'>♻️ Restart</a>"
-       "</div>";
+       "<a href='/log?raw=1'>⌨️ «Log tekstem|Log as text»</a>"
+       "<a href='/reboot'>♻️ «Restart|Restart»</a>"
+       "<span style='margin-left:14px'>🌐 «Język|Language»: </span>";
+  h += langBar();
+  h += "</div>";
+  h += langScript();
   return h;
 }
 
@@ -3993,7 +4157,7 @@ String buildDiagReport() {
   s += "Restarty watchdog / WDT reset: " + String(rtcWdtResets) + "\n";
   s += "Brownout (zasilanie)         : " + String(rtcBrownouts) + "\n";
   s += "Crash (panic)                : " + String(rtcPanics) + "\n";
-  s += "Tryb odbioru / RX mode       : " + String(rxMode == MODE_VEVOR_7IN1 ? "VEVOR 7-in-1" :
+  s += "«Tryb odbioru|RX mode»       : " + String(rxMode == MODE_VEVOR_7IN1 ? "VEVOR 7-in-1" :
                                                 rxMode == MODE_VEVOR_YT60309 ? "VEVOR YT60309" :
                                                 rxMode == MODE_FINE_OFFSET ? "Fine Offset" :
                                                 rxMode == MODE_BRESSER ? "Bresser" :
@@ -4055,7 +4219,7 @@ void handleLog() {
     server.send(200, "text/plain; charset=utf-8", buildDiagReport());
     return;
   }
-  String h = diagPageStart("📋 Log systemowy / System log",
+  String h = diagPageStart("📋 «Log systemowy|System log»",
                            "Log zdarzeń, stan radia i systemu. Odświeża się sam co 5 s (bez przeładowania).",
                            "Event log, radio and system status. Auto-refreshes every 5 s (no page reload).",
                            true);
@@ -4108,7 +4272,7 @@ void handleErrorsPage() {
     }
   }
 
-  String h = diagPageStart("🚨 Plik błędów / Error log file",
+  String h = diagPageStart("🚨 «Plik błędów|Error log file»",
                            "Do pliku trafiają TYLKO błędy. Zwykłe zdarzenia są w /log (pamięć RAM).",
                            "ONLY errors are written to the file. Regular events live in /log (RAM).",
                            false);
@@ -4174,6 +4338,8 @@ void handleStatus() {
   j += "\"maxLoopMs\":" + String(statMaxLoopMs) + ",";
   j += "\"loopCount\":" + String(statLoopCount) + ",";
   j += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  j += "\"mqttEnabled\":" + String(mqttCfg.enabled ? "true" : "false") + ",";
+  j += "\"mqttConnected\":" + String((mqttCfg.enabled && mqtt.connected()) ? "true" : "false") + ",";
   j += "\"wifiIp\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("")) + "\",";
   j += "\"wifiApIp\":\"" + WiFi.softAPIP().toString() + "\",";
   j += "\"wifiRssi\":" + String(WiFi.RSSI()) + ",";
@@ -4187,14 +4353,16 @@ void handleStatus() {
   for (int i = 0; i < logCount; i++) {
     LogEntry& e = eventLog[(start + i) % MAX_LOG];
     if (i) j += ",";
-    j += "{\"t\":" + String(e.t / 1000) + ",\"level\":" + String(e.level) + ",\"msg\":\"" + String(e.msg) + "\"}";
+    // Do JSON trafia tylko wersja polska (bez markerów «PL|EN»).
+    j += "{\"t\":" + String(e.t / 1000) + ",\"level\":" + String(e.level) +
+         ",\"msg\":\"" + stripLang(String(e.msg)) + "\"}";
   }
   j += "]}";
   server.send(200, "application/json", j);
 }
 
 void handleReboot() {
-  logEventS(LOG_WARN, "Zdalny restart na zadanie");
+  logEventS(LOG_WARN, "«Zdalny restart na zadanie|Remote reboot requested»");
   server.send(200, "text/plain; charset=utf-8", "Restartowanie...");
   delay(300);
   ESP.restart();
@@ -4206,7 +4374,7 @@ void handleErrorsRaw() {
   if (server.hasArg("clear")) {
     if (fsReady && LittleFS.remove(ERR_FILE)) {
       errFileLines = 0;
-      logEvent(LOG_INFO, "Plik bledow skasowany zdalnie");
+      logEvent(LOG_INFO, "«Plik bledow skasowany zdalnie|Error file cleared remotely»");
       server.send(200, "text/plain; charset=utf-8", "Plik bledow skasowany.\n");
     } else {
       server.send(500, "text/plain; charset=utf-8", "Nie udalo sie skasowac pliku.\n");
@@ -4256,7 +4424,7 @@ void handleErrorsRaw() {
 
 // /errtest - zapisuje testowy błąd do pliku (weryfikacja, że zapis działa)
 void handleErrTest() {
-  logEventS(LOG_ERROR, "Test zapisu bledu do pliku");
+  logEventS(LOG_ERROR, "«Test zapisu bledu do pliku|Test error-file write»");
   String out = "Zapisano testowy blad.\nSprawdz /errors\n";
   server.send(200, "text/plain; charset=utf-8", out);
 }
@@ -4283,7 +4451,7 @@ void timeGuard() {
     char b[24];
     snprintf(b, sizeof(b), "%04d-%02d-%02d %02d:%02d:%02d",
              ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday, ti.tm_hour, ti.tm_min, ti.tm_sec);
-    logEventS(LOG_INFO, "Czas NTP zsynchronizowany: " + String(b));
+    logEventS(LOG_INFO, "«Czas NTP zsynchronizowany|NTP time synchronised»: " + String(b));
     errFileRotate(true);   // teraz znamy czas - przytnij stare wpisy
   }
 }
@@ -4302,14 +4470,14 @@ void wifiGuard() {
   if (connected) {
     if (!wasConnected) {
       wasConnected = true;
-      logEventS(LOG_INFO, "WiFi polaczone: " + WiFi.localIP().toString());
+      logEventS(LOG_INFO, "«WiFi polaczone|WiFi connected»: " + WiFi.localIP().toString());
     }
     return;
   }
 
   if (wasConnected) {
     wasConnected = false;
-    logEventS(LOG_WARN, "WiFi rozlaczone - probuje polaczyc ponownie");
+    logEventS(LOG_WARN, "«WiFi rozlaczone - probuje polaczyc ponownie|WiFi disconnected - reconnecting»");
   }
   if (wifiCfg.staSsid.length() == 0) return;      // brak skonfigurowanego STA
   if (millis() - lastAttempt < 20000) return;     // nie częściej niż co 20 s
@@ -4355,12 +4523,12 @@ void setup() {
   logEvent(LOG_INFO, String("Start #") + String(rtcBootCount) + ": " +
            String(resetReasonText(bootResetReason)));
   if (bootResetReason == ESP_RST_BROWNOUT)
-    logEventS(LOG_ERROR, "BROWNOUT! Slabe zasilanie (kondensator/przewody?)");
+    logEventS(LOG_ERROR, "«BROWNOUT! Slabe zasilanie (kondensator/przewody?)|BROWNOUT! Weak supply (capacitor/wires?)»");
   else if (bootResetReason == ESP_RST_TASK_WDT || bootResetReason == ESP_RST_INT_WDT ||
            bootResetReason == ESP_RST_WDT)
-    logEventS(LOG_ERROR, "Restart przez WATCHDOG - firmware sie zawiesil");
+    logEventS(LOG_ERROR, "«Restart przez WATCHDOG - firmware sie zawiesil|WATCHDOG restart - firmware hung»");
   else if (bootResetReason == ESP_RST_PANIC)
-    logEventS(LOG_ERROR, "Restart po CRASH (panic)");
+    logEventS(LOG_ERROR, "«Restart po CRASH (panic)|Restart after CRASH (panic)»");
 
   ccInitBase();
   Serial.print("CC1101 VERSION=0x");
@@ -4404,7 +4572,7 @@ void setup() {
 
   // Filtr ramek
   loadFilterCfg();
-  Serial.print("Filtr ramek / Frame filter: ");
+  Serial.print("«Filtr ramek|Frame filter»: ");
   Serial.println(filterCfg.enabled ? "WLACZONY" : "WYLACZONY");
   if (filterCfg.enabled) {
     Serial.println("  wzorzec: " + filterCfg.pattern);
@@ -4475,7 +4643,7 @@ void setup() {
   startTime = millis();
   Serial.println("Nasluch...\n");
 
-  logEventS(LOG_INFO, "System gotowy - nasluch uruchomiony");
+  logEventS(LOG_INFO, "«System gotowy - nasluch uruchomiony|System ready - listening started»");
   // Watchdog startuje NA KOŃCU setup - od tego momentu loop() musi go karmić.
   wdtBegin();
   Serial.println(wdtEnabled ? "Watchdog: wlaczony (30 s)" : "Watchdog: NIE udalo sie wlaczyc");
