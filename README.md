@@ -218,10 +218,22 @@ PlatformIO pobierze je automatycznie przy pierwszym budowaniu (kilkadziesiąt MB
 to trwa).
 
 > **Pierwszy build może się nie udać** — PlatformIO instaluje wtedy platformę i narzędzia
-> i potrafi przerwać z błędem typu `TypeError: ... not 'NoneType'`. To normalne:
-> **uruchom `pio run` jeszcze raz** i kompilacja przejdzie. Ten projekt był sprawdzony
-> pod kątem czystego builda (świeży katalog bez `.pio`) na obu środowiskach:
+> i potrafi przerwać z błędem typu `TypeError: ... not 'NoneType'` albo brakiem nagłówka
+> (`esp32-hal-ldo.h: No such file or directory`, `pins_arduino.h: No such file or directory`).
+> Wtedy brakuje pakietu frameworku. Napraw to tak:
+>
+> ```bash
+> pio pkg install -e esp32-wroom
+> pio run -e esp32-wroom
+> ```
+>
+> Samo powtórzenie `pio run` może nie wystarczyć. Ten projekt był sprawdzony pod kątem
+> czystego builda (świeży katalog bez `.pio`) na obu środowiskach:
 > `esp32-wroom` → OK (Flash 65,2 %, RAM 19,5 %), `esp32s3` → OK (Flash 37,8 %, RAM 18,9 %).
+>
+> **Nie buduj tego projektu platformą `espressif32` z rejestru PlatformIO** (to Arduino
+> core 2.x). Instaluje ona framework pod tą samą nazwą i nadpisuje właściwą wersję 3.3.12,
+> przez co kolejne buildy padają.
 
 > **Wgrywanie na płytkę WROOM:** niektóre płytki WROOM-32 (szczególnie z konwerterem
 > CH340) nie robią autoresetu niezawodnie. Jeśli `pio run -e esp32-wroom -t upload`
@@ -541,10 +553,22 @@ platform = https://github.com/pioarduino/platform-espressif32/releases/download/
 PlatformIO downloads it on the first build (tens of MB, takes a moment).
 
 > **The first build may fail** — PlatformIO is installing the platform and tools and can
-> abort with an error such as `TypeError: ... not 'NoneType'`. That is normal: **run
-> `pio run` again** and it will compile. This project was verified with a clean build
+> abort with an error such as `TypeError: ... not 'NoneType'`, or with a missing header
+> (`esp32-hal-ldo.h: No such file or directory`, `pins_arduino.h: No such file or directory`).
+> In that case the framework package is missing. Fix it with:
+>
+> ```bash
+> pio pkg install -e esp32-wroom
+> pio run -e esp32-wroom
+> ```
+>
+> Simply re-running `pio run` may not help. This project was verified with a clean build
 > (fresh directory, no `.pio`) on both environments:
 > `esp32-wroom` → OK (Flash 65.2 %, RAM 19.5 %), `esp32s3` → OK (Flash 37.8 %, RAM 18.9 %).
+>
+> **Do not build this project with the registry `espressif32` platform** (that is Arduino
+> core 2.x). It installs the framework under the same name and overwrites the correct
+> 3.3.12 version, which makes subsequent builds fail.
 
 > **Flashing the WROOM board:** some WROOM-32 boards (especially those with a CH340
 > converter) do not auto-reset reliably. If `pio run -e esp32-wroom -t upload` reports
