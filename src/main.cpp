@@ -20,6 +20,7 @@
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <PubSubClient.h>
+#include <Update.h>
 #include "decoders.h"
 
 // ==================== KONFIGURACJA ====================
@@ -426,15 +427,17 @@ bool ccStartRx() {
 }
 
 // AUTOMATYCZNY DOBÓR PRĘDKOŚCI SPI.
-// Test: zapisz wzorzec 0xA5 do rejestru SYNC1 (0x04, nieużywany w tym trybie)
-// i odczytaj go z powrotem. Jeśli zapis faktycznie dotarł, odczyt = 0xA5.
-// Wybierana jest NAJSZYBSZA prędkość, przy której to działa.
+// Test: zapisz wzorzec 0xA5 do rejestru CHANNR (0x0A, nieużywany - adresowanie
+// wyłączone) i odczytaj go z powrotem. Jeśli zapis faktycznie dotarł,
+// odczyt = 0xA5. Wybierana jest NAJSZYBSZA prędkość, przy której to działa.
 // Dzięki temu firmware sam radzi sobie z długimi kablami / słabym kontaktem,
 // gdzie zapisy przestają docierać, a odczyty jeszcze działają.
+// UWAGA: nie wolno tu używać 0x04 (SYNC1) ani 0x05 (SYNC0) - to teraz
+// aktywne rejestry sync word w trybie VEVOR.
 bool ccSpiAutotune() {
   static const uint32_t cand[] = { 4000000, 2000000, 1000000, 500000, 250000, 100000 };
   const unsigned NC = sizeof(cand) / sizeof(cand[0]);
-  const uint8_t R = 0x04;   // SYNC1
+  const uint8_t R = 0x0A;   // CHANNR - nieużywany (adresowanie wyłączone)
   uint8_t got[6], orig[6];
   uint32_t chosen = 0;
 
@@ -620,10 +623,9 @@ void applyFineOffsetMode() {
 }
 
 // ==================== TRYB VEVOR / YOUTONG 7-in-1 ====================
-// 868.30 MHz, 2-FSK, ~11.11 kbit/s. Odbior BEZ hardware sync: hardware sync
-// na tym sygnale nie lapie (stacja ma nietypowa preambule), wiec dekoder
-// sam szuka wzorca "CA 54" w strumieniu surowych bajtow (metoda potwierdzona
-// snifferem).
+// 868.30 MHz, 2-FSK, ~11.11 kbit/s. Odbior bez hardware sync (infinite
+// length): dekoder szuka wzorca "CA 54" w strumieniu surowych bajtow.
+// Metoda potwierdzona snifferem (to samo dzialalo na ESP32-S3).
 void applyVevorMode() {
   ccStrobe(0x36);  // SIDLE
   ccStrobe(CC_SFRX);  // SFRX
@@ -829,7 +831,25 @@ void loopVevor() {
 
   radioHealthGuard();
 
-  uint8_t rxBytes = ccStatusRead(0x3B) & 0x7F;  // RXBYTES
+  // RXBYTES (0x3B): bit 7 = FIFO_OVERFLOW, bity 6:0 = liczba bajtow.
+  uint8_t rxBytesRaw = ccStatusRead(0x3B);
+  bool overflow = (rxBytesRaw & 0x80) != 0;
+  uint8_t rxBytes = rxBytesRaw & 0x7F;
+
+  if (overflow) {
+    // FIFO sie przelało (szum przy braku sync). Wyczysc i wroc do RX -
+    // ale nie częściej niż raz na sekundę (SRX strobowany za czesto
+    // trwale blokuje CC1101).
+    static unsigned long lastFlush = 0;
+    if (millis() - lastFlush >= 1000) {
+      lastFlush = millis();
+      ccStartRx();
+    }
+    rcount = 0;
+    delay(1);
+    return;
+  }
+
   if (rxBytes == 0) {
     // Bufor pusty. Stan radia sprawdzamy RZADKO - częste strobowanie SRX
     // trwale blokuje CC1101 (potwierdzone testem: po ~265 strobach pada
@@ -849,13 +869,14 @@ void loopVevor() {
     return;
   }
 
-  // Bufor prawie pelny - wyczysc i wroc do RX, ale nie częściej niż raz na sekundę.
-  if (rxBytes >= 120) {
-    static unsigned long lastFlush = 0;
-    if (millis() - lastFlush >= 1000) {
-      lastFlush = millis();
+  // Bufor prawie pelny (64 bajty) - wyczysc, zeby nie tracic danych.
+  if (rxBytes >= 60) {
+    static unsigned long lastFlush2 = 0;
+    if (millis() - lastFlush2 >= 1000) {
+      lastFlush2 = millis();
       ccStartRx();
     }
+    rcount = 0;
     delay(1);
     return;
   }
@@ -874,42 +895,58 @@ void loopVevor() {
     if (rcount < 1024) rcount++;
   }
 
-  // Szukaj "CA 54" w buforze (sync + payload 28 B = 30 B min).
-  for (int off = 0; off + 30 <= rcount; off++) {
-    int idx = (rhead - rcount + off + 1024 * 4) % 1024;
-    if (rbuf[idx] == 0xCA && rbuf[(idx + 1) % 1024] == 0x54) {
-      uint8_t frame[28];
-      for (int k = 0; k < 28; k++) frame[k] = rbuf[(idx + 2 + k) % 1024];
-      WeatherData w;
-      if (decodeVevor7in1(frame, 28, w)) {
-        totalFrames++;
-        w.rssi = rssi;
-        w.t = millis();
-        lastWeather = w;
-        lastWeatherCal = calibrateWeather(w);
-        lastWeatherValid = true;
-        lastDecodedHex = bytesToHex(frame, 28);
-        acceptedFrames++;
-        diagPush(frame, 28, rssi, true);
-        publishWeather();
+  // Szukaj sync "CA 54" (16 bitów) na KAŻDEJ pozycji bitowej bufora.
+  // Bajty z demodulatora (tryb infinite length) są przesunięte o 0-7 bitów
+  // względem transmisji, więc szukanie tylko po całych bajtach trafia tylko
+  // ułamek ramek. Szukanie bitowe łapie każdą ramkę niezależnie od fazy.
+  // Lambda zwraca bit o indeksie `pos` (0 = najstarszy bit w buforze).
+  auto ringBit = [&](int pos) -> uint8_t {
+    int byteIdx = (rhead - rcount + pos / 8 + 1024 * 4) % 1024;
+    return (rbuf[byteIdx] >> (7 - (pos & 7))) & 1;
+  };
 
-        Serial.print("POGODA ");
-        Serial.print(w.model);
-        Serial.print(" id="); Serial.print(w.id);
-        if (w.haveTemp) { Serial.print(" T="); Serial.print(w.tempC, 1); Serial.print("C"); }
-        if (w.haveHum)  { Serial.print(" RH="); Serial.print(w.humidity); Serial.print("%"); }
-        if (w.haveWind) { Serial.print(" wiatr="); Serial.print(w.windAvgMs, 1); Serial.print("m/s"); }
-        if (w.haveGust) { Serial.print(" poryw="); Serial.print(w.windMaxMs, 1); Serial.print("m/s"); }
-        if (w.haveWindDir) { Serial.print(" dir="); Serial.print(w.windDirDeg); Serial.print("("); Serial.print(windDirText(w.windDirDeg)); Serial.print(")"); }
-        if (w.haveRain) { Serial.print(" deszcz="); Serial.print(w.rainMm, 1); Serial.print("mm"); }
-        if (w.haveUv)   { Serial.print(" UV="); Serial.print(w.uv); Serial.print("/"); Serial.print(w.uvi); }
-        if (w.haveLight){ Serial.print(" lux="); Serial.print(w.lightLux, 0); }
-        Serial.print(" RSSI="); Serial.print(rssi);
-        Serial.print(" hex="); Serial.println(lastDecodedHex);
-        // Wyczyść bufor, żeby nie dekodować tej samej paczki wielokrotnie.
-        rcount = 0;
-        return;
-      }
+  for (int b = 0; b + 240 <= rcount * 8; b++) {
+    // Odczytaj 16 bitów sync.
+    uint16_t sync = 0;
+    for (int i = 0; i < 16; i++) sync = (uint16_t)((sync << 1) | ringBit(b + i));
+    if (sync != 0xCA54) continue;
+
+    // Odczytaj 28 bajtów payloadu (224 bity) po sync.
+    uint8_t frame[28];
+    for (int k = 0; k < 28; k++) {
+      uint8_t byteVal = 0;
+      for (int bit = 0; bit < 8; bit++) byteVal = (uint8_t)((byteVal << 1) | ringBit(b + 16 + k * 8 + bit));
+      frame[k] = byteVal;
+    }
+    WeatherData w;
+    if (decodeVevor7in1(frame, 28, w)) {
+      totalFrames++;
+      w.rssi = rssi;
+      w.t = millis();
+      lastWeather = w;
+      lastWeatherCal = calibrateWeather(w);
+      lastWeatherValid = true;
+      lastDecodedHex = bytesToHex(frame, 28);
+      acceptedFrames++;
+      diagPush(frame, 28, rssi, true);
+      publishWeather();
+
+      Serial.print("POGODA ");
+      Serial.print(w.model);
+      Serial.print(" id="); Serial.print(w.id);
+      if (w.haveTemp) { Serial.print(" T="); Serial.print(w.tempC, 1); Serial.print("C"); }
+      if (w.haveHum)  { Serial.print(" RH="); Serial.print(w.humidity); Serial.print("%"); }
+      if (w.haveWind) { Serial.print(" wiatr="); Serial.print(w.windAvgMs, 1); Serial.print("m/s"); }
+      if (w.haveGust) { Serial.print(" poryw="); Serial.print(w.windMaxMs, 1); Serial.print("m/s"); }
+      if (w.haveWindDir) { Serial.print(" dir="); Serial.print(w.windDirDeg); Serial.print("("); Serial.print(windDirText(w.windDirDeg)); Serial.print(")"); }
+      if (w.haveRain) { Serial.print(" deszcz="); Serial.print(w.rainMm, 1); Serial.print("mm"); }
+      if (w.haveUv)   { Serial.print(" UV="); Serial.print(w.uv); Serial.print("/"); Serial.print(w.uvi); }
+      if (w.haveLight){ Serial.print(" lux="); Serial.print(w.lightLux, 0); }
+      Serial.print(" RSSI="); Serial.print(rssi);
+      Serial.print(" hex="); Serial.println(lastDecodedHex);
+      // Wyczyść bufor, żeby nie dekodować tej samej paczki wielokrotnie.
+      rcount = 0;
+      return;
     }
   }
 }
@@ -2369,22 +2406,27 @@ void saveWifiCfg() {
 }
 
 void applyWifi() {
-  // AP zawsze włączony + równoległa próba połączenia z siecią kliencką.
-  WiFi.mode(WIFI_AP_STA);
-
-  // Obniż moc nadawczą WiFi. Pełna moc ESP32 (~20 dBm) wstrzykuje krótkie
-  // skoki szumu do CC1101 (-74 dBm) na każdej częstotliwości i maskuje
-  // słabsze sygnały stacji pogodowej. Niska moc nadal starcza na domowy
-  // zasięg, a radia przestaje "głuszyć".
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
-
-  if (wifiCfg.apPass.length() >= 8) {
-    WiFi.softAP(wifiCfg.apSsid.c_str(), wifiCfg.apPass.c_str());
+  // AP tylko wtedy, gdy NIE mamy skonfigurowanego STA. Beacony AP nadawane
+  // non-stop zagłuszają odbiornik 868 MHz - po połączeniu z domowym WiFi
+  // wyłączamy AP, żeby CC1101 miał ciszę.
+  if (wifiCfg.staSsid.length() == 0) {
+    WiFi.mode(WIFI_AP);
   } else {
-    WiFi.softAP(wifiCfg.apSsid.c_str());  // AP otwarty (hasło za krótkie)
+    WiFi.mode(WIFI_STA);
   }
 
+  // Obniż moc nadawczą WiFi (po ustawieniu trybu!). Pełna moc ESP32 (~20 dBm)
+  // wstrzykuje krótkie skoki szumu do CC1101 i maskuje słabsze sygnały stacji.
+  // Router jest kilka metrów dalej - 2 dBm w zupełności wystarczy, a radio
+  // przestaje być głuszone. Na WROOM antena WiFi jest bliżej CC1101 niż na S3.
+  WiFi.setTxPower(WIFI_POWER_2dBm);
+
   if (wifiCfg.staSsid.length() == 0) {
+    if (wifiCfg.apPass.length() >= 8) {
+      WiFi.softAP(wifiCfg.apSsid.c_str(), wifiCfg.apPass.c_str());
+    } else {
+      WiFi.softAP(wifiCfg.apSsid.c_str());  // AP otwarty (hasło za krótkie)
+    }
     Serial.println("Brak skonfigurowanego SSID STA - praca tylko w trybie AP.");
     return;
   }
@@ -3425,6 +3467,52 @@ void handleSpiTest() {
   server.send(200, "text/plain; charset=utf-8", s);
 }
 
+// ==================== OTA (aktualizacja firmware przez WWW) ====================
+// Pozwala wgrać nowy firmware przez przeglądarkę - bez USB i bez przycisku BOOT.
+// Ważne: wgrywany plik to `firmware.bin` (sama aplikacja, ~1,2 MB), NIE
+// `firmware.factory.bin` (ten zawiera bootloader + tablicę partycji).
+void handleOtaForm() {
+  String h = "<html><meta charset='utf-8'><body style='font-family:sans-serif'>"
+             "<h2>Aktualizacja firmware (OTA)</h2>"
+             "<p>Wybierz plik <b>firmware.bin</b> (sama aplikacja, ~1,2 MB). "
+             "NIE używaj pliku factory.bin.</p>"
+             "<form method='POST' action='/update' enctype='multipart/form-data'>"
+             "<input type='file' name='fw' accept='.bin'> "
+             "<input type='submit' value='Wgraj i zrestartuj'>"
+             "</form></body></html>";
+  server.send(200, "text/html; charset=utf-8", h);
+}
+
+void handleOtaUpdate() {
+  if (Update.hasError()) {
+    server.send(500, "text/plain", "BLAD aktualizacji: " + String(Update.errorString()));
+    return;
+  }
+  server.send(200, "text/plain", "OK. Restart...");
+  delay(500);
+  ESP.restart();
+}
+
+void handleOtaUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("OTA: start %s (%u B)\n", upload.filename.c_str(), upload.totalSize);
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.printf("OTA: gotowe, %u B, restart\n", upload.totalSize);
+    } else {
+      Update.printError(Serial);
+    }
+  }
+}
+
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
@@ -3536,6 +3624,8 @@ void setup() {
   server.on("/capstart", handleCaptureStart);
   server.on("/capstop", handleCaptureStop);
   server.on("/selftest", handleSelfTest);
+  server.on("/update", HTTP_GET, handleOtaForm);
+  server.on("/update", HTTP_POST, handleOtaUpdate, handleOtaUpload);
   server.begin();
   Serial.println("Web server na porcie 80");
 
@@ -3547,13 +3637,10 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  // Co 30 s sprawdzamy, czy zapisy do CC1101 nadal docieraja, i w razie
-  // potrzeby dobieramy wolniejsza predkosc SPI (dlugie kable, slaby kontakt).
-  static unsigned long lastSpiCheck = 0;
-  if (millis() - lastSpiCheck >= 30000) {
-    lastSpiCheck = millis();
-    ccSpiAutotune();
-  }
+  // UWAGA: NIE uruchamiamy tu ccSpiAutotune() cyklicznie. Test SPI (24 zapisy
+  // do CC1101) blokowal petle na tyle dlugo, ze przy stacji nadajacej co 20 s
+  // gubilismy ramki. Autotune jest wykonywany raz przy starcie (w setup).
+  // Jesli polaczenie sie pogorszy, radioHealthGuard i tak zreinicjalizuje radio.
 
   // Tryb sondy RSSI ma priorytet
   if (probeFreqIdx >= 0) {
