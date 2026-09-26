@@ -141,13 +141,34 @@ dostaje inny port niż `COM12`.
 > Jeśli płytka zgłasza `Invalid head of packet` — to zakłócenie synchronizacji;
 > po prostu powtórz wgrywanie.
 
+### Aktualizacja firmware przez OTA (bez USB i przycisku)
+
+Firmware ma wbudowaną aktualizację przez WWW — wystarczy przeglądarka:
+
+1. Wejdź na **http://192.168.1.130/update** (albo `http://192.168.4.1/update`, gdy urządzenie jest w trybie AP).
+2. Wybierz plik **`firmware.bin`** (sama aplikacja, ~1,2 MB — **NIE** `firmware.factory.bin`).
+3. Kliknij „Wgraj i zrestartuj". Urządzenie się zrestartuje z nowym firmware.
+
+Dzięki temu kolejne aktualizacje **nie wymagają USB ani przycisku BOOT**.
+Plik `firmware.bin` powstaje po `pio run -e esp32-wroom` w katalogu
+`.pio/build/esp32-wroom/firmware.bin`.
+
+> **Uwaga:** OTA wymaga tablicy partycji z dwoma partycjami aplikacji
+> (`min_spiffs.csv` — ustawiona domyślnie dla WROOM). Jeśli na płytce jest stara
+> tablica `huge_app.csv`, wgraj raz przez USB (BOOT+EN), a potem już zawsze OTA.
+
 ### Konfiguracja sieci
 
 - **AP (punkt dostępowy)**: SSID `WeatherSniffer`, hasło `sniffer123`, adres `192.168.4.1`.
-  AP działa zawsze — można się do niego podłączyć i skonfigurować sieć.
+  AP jest włączony tylko wtedy, gdy **nie** masz skonfigurowanego WiFi STA. Po połączeniu
+  z domowym WiFi AP się wyłącza — to celowe: beacony AP zagłuszały odbiornik 868 MHz.
 - **STA (Twoje WiFi)**: konfiguruje się przez panel WWW (zakładka ustawień). Dane są zapisywane
   w pamięci NVS urządzenia — **nie wpisuj ich w kodzie źródłowym** (ten plik może trafić na
   publiczne repozytorium).
+
+> **Moc WiFi:** firmware celowo obniża moc nadawczą WiFi do 2 dBm. Pełna moc ESP32
+> (~20 dBm) wstrzykiwała szum do CC1101 i zagłuszała słabe ramki stacji pogodowej
+> (RSSI spadało o ~12 dB). 2 dBm w zupełności wystarcza na kilka metrów do routera.
 
 > **Uwaga:** wgranie scalonego obrazu `firmware.factory.bin` od adresu `0x0`
 > (np. `esptool write-flash 0x0 firmware.factory.bin`) **kasuje NVS** — tracisz
@@ -316,13 +337,34 @@ gets a different port than `COM12`.
 >
 > An `Invalid head of packet` error is a sync glitch — just retry the upload.
 
+### Over-the-air firmware update (no USB, no button)
+
+The firmware has a built-in web update — just use a browser:
+
+1. Open **http://192.168.1.130/update** (or `http://192.168.4.1/update` in AP mode).
+2. Choose the **`firmware.bin`** file (the application only, ~1.2 MB — **NOT** `firmware.factory.bin`).
+3. Click "Wgraj i zrestartuj" (upload and restart). The device reboots with the new firmware.
+
+This means future updates **need no USB and no BOOT button**. `firmware.bin` is produced
+by `pio run -e esp32-wroom` at `.pio/build/esp32-wroom/firmware.bin`.
+
+> **Note:** OTA requires a partition table with two app partitions
+> (`min_spiffs.csv` — the default for WROOM). If the board still has the old
+> `huge_app.csv`, flash it once over USB (BOOT+EN), then use OTA from then on.
+
 ### Network configuration
 
 - **AP (access point)**: SSID `WeatherSniffer`, password `sniffer123`, address `192.168.4.1`.
-  The AP is always on, so you can connect and configure the network.
+  The AP is enabled only when **no** STA WiFi is configured. Once connected to your home
+  WiFi the AP turns off — this is intentional: the AP beacons were desensitizing the 868 MHz
+  receiver.
 - **STA (your WiFi)**: configured via the web panel (settings tab). Credentials are stored in the
   device's NVS memory — **do not put them in the source code** (this file may end up in a public
   repository).
+
+> **WiFi power:** the firmware deliberately lowers the WiFi TX power to 2 dBm. Full ESP32
+> power (~20 dBm) injected noise into the CC1101 and masked the station's weak frames
+> (RSSI dropped by ~12 dB). 2 dBm is plenty for a router a few meters away.
 
 > **Note:** flashing a merged `firmware.factory.bin` from address `0x0`
 > (e.g. `esptool write-flash 0x0 firmware.factory.bin`) **erases NVS** — you lose
