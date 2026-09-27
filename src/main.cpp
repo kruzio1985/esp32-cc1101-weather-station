@@ -392,6 +392,9 @@ void logEvent(uint8_t level, const String& msg) {
 // Deklaracja w przód - errFileAppend jest zdefiniowana niżej (sekcja pliku błędów).
 void errFileAppend(const String& msg);
 
+// Deklaracja w przód - healthAppend jest zdefiniowana niżej (sekcja pliku zdrowia).
+void healthAppend(const String& msg);
+
 // Zdarzenia trafiają też na port szeregowy (żeby dało się podejrzeć po USB).
 // BŁĘDY dodatkowo lądują w pliku na flashu (z rotacją - patrz errFileAppend).
 void logEventS(uint8_t level, const String& msg) {
@@ -1949,6 +1952,16 @@ void applySend() {
   }
 }
 
+// Backoff wysyłki HTTP. Każda próba blokuje pętlę do ~1,5 s, więc gdy stacja
+// główna nie odpowiada, nie ma sensu próbować przy każdej ramce. Po
+// SEND_FAIL_LIMIT nieudanych próbach z rzędu wstrzymujemy wysyłkę na
+// SEND_BACKOFF_MS. Nic przy tym nie tracimy: stacja główna SAMA odpytuje nasz
+// /json (extdev, co 20 s), więc wysyłka jest tylko dodatkowym kanałem.
+const int SEND_FAIL_LIMIT = 3;
+const unsigned long SEND_BACKOFF_MS = 300000UL;   // 5 minut
+int sendFailRun = 0;
+unsigned long sendSkipUntil = 0;
+
 // Wysyła ostatnie (skalibrowane) dane wszystkimi włączonymi kanałami.
 void publishWeather() {
   if (!lastWeatherValid) return;
@@ -1957,21 +1970,38 @@ void publishWeather() {
 
   // 1) HTTP POST do innego ESP / dowolnego odbiorcy JSON
   if (sendCfg.wifiEnabled && sendCfg.targetUrl.length() > 0 && WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.setTimeout(1500);          // odczyt odpowiedzi - max 1,5 s
-    http.setConnectTimeout(1500);   // samo nawiazanie - max 1,5 s (bez tego
-                                    // przy nieosiagalnej stacji glównej loop
-                                    // stoi kilka sekund przy kazdej wysylce)
-    if (http.begin(sendCfg.targetUrl)) {
-      http.addHeader("Content-Type", "application/json");
-      int code = http.POST(json);
-      if (code < 0) {
-        Serial.print("HTTP wysylka blad: ");
-        Serial.println(http.errorToString(code));
-      }
-      http.end();
+    if (millis() < sendSkipUntil) {
+      // Trwa przerwa po nieudanych próbach - pomijamy (bez blokowania pętli).
     } else {
-      Serial.println("HTTP: nie mozna utworzyc polaczenia z " + sendCfg.targetUrl);
+      HTTPClient http;
+      http.setTimeout(1500);          // odczyt odpowiedzi - max 1,5 s
+      http.setConnectTimeout(1500);   // samo nawiazanie - max 1,5 s (bez tego
+                                      // przy nieosiagalnej stacji glownej loop
+                                      // stoi kilka sekund przy kazdej wysylce)
+      bool ok = false;
+      if (http.begin(sendCfg.targetUrl)) {
+        http.addHeader("Content-Type", "application/json");
+        int code = http.POST(json);
+        if (code > 0) {
+          ok = true;
+        } else {
+          Serial.print("HTTP wysylka blad: ");
+          Serial.println(http.errorToString(code));
+        }
+        http.end();
+      } else {
+        Serial.println("HTTP: nie mozna utworzyc polaczenia z " + sendCfg.targetUrl);
+      }
+
+      if (ok) {
+        sendFailRun = 0;
+      } else if (++sendFailRun >= SEND_FAIL_LIMIT) {
+        sendSkipUntil = millis() + SEND_BACKOFF_MS;
+        sendFailRun = 0;
+        logEventS(LOG_WARN, "«Wysylka HTTP nie dziala - przerwa 5 min|HTTP sending failed - pausing 5 min»: " +
+                           sendCfg.targetUrl);
+        healthAppend("http: " + String(SEND_FAIL_LIMIT) + " bledow z rzedu, przerwa 5 min (" + sendCfg.targetUrl + ")");
+      }
     }
   }
 
