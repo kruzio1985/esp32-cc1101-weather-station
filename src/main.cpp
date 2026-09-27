@@ -992,12 +992,20 @@ void applyVevorMode() {
 
   ccWrite(0x10, 0x98);  // MDMCFG4: rate ~11.11k, BW 162.5 kHz
   ccWrite(0x11, 0xC0);  // MDMCFG3: DRATE_M=192 -> ~11.11 kbaud
-  ccWrite(0x12, 0x00);  // MDMCFG2: 2-FSK, bez sync (software sync)
+  // UWAGA (sprawdzone na sprzęcie 2026-09-27): próbowano tu SPRZĘTOWEGO sync
+  // word (SYNC1=0xCA, SYNC0=0x54, MDMCFG2=0x02, stała długość 28 B), żeby
+  // przestać zalewać FIFO szumem. Efekt: przez 6 minut ZERO ramek - CC1101 nie
+  // wykrywał tego sync worda (prawdopodobnie przez odchyłkę dewiacji/przebieg
+  // demodulatora). Synchronizacja PROGRAMOWA (poniżej) działa, więc zostaje.
+  ccWrite(0x12, 0x00);  // MDMCFG2: 2-FSK, bez sync (synchronizacja programowa)
   ccWrite(0x13, 0x22);  // MDMCFG1
   ccWrite(0x14, 0xF8);  // MDMCFG0
   ccWrite(0x15, 0x44);  // DEVIATN ~38 kHz (jak w snifferze, ktory dekodowal)
   ccWrite(0x06, 0xFF);  // PKTLEN = 255
   ccWrite(0x07, 0x00);  // PKTCTRL1
+  // PKTCTRL0 = 0x02: dlugosc nieskonczona. Radio wylewa do FIFO wszystko, co
+  // zdemoduluje (takze szum) - dlatego petla odbioru MUSI na biezaco oproznijac
+  // bufor, inaczej wchodzi w MARCSTATE=RXFIFO_OVERFLOW i traci transmisje.
   ccWrite(0x08, 0x02);  // PKTCTRL0: nieskonczona dlugosc
 
   delay(3);
@@ -1185,11 +1193,79 @@ void radioHealthGuard() {
   applyVevorMode();
 }
 
+// ==================== WATCHDOG ODBIORU ====================
+// radioHealthGuard() sprawdza tylko, czy radio ODPOWIADA po SPI. Zdarza sie
+// jednak, ze radio odpowiada i melduje MARCSTATE=0x0D (RX), a mimo to nie
+// odbiera zadnej ramki - bo np. demodulator sie rozstroil albo tor RX utknal.
+// Wtedy pomaga PELNE przelozenie toru odbioru. Ten straznik to wykrywa.
+const unsigned long RX_STALL_MS = 120000;   // 2 min bez ramki = podejrzane
+unsigned long lastFrameMs = 0;              // millis() ostatniej dobrej ramki
+uint32_t statRxStalls = 0;                  // ile razy wykryto zastoj odbioru
+
+void rxStallGuard() {
+  static unsigned long lastTry = 0;
+  unsigned long now = millis();
+  unsigned long ref = lastFrameMs ? lastFrameMs : startTime;
+
+  if (now - ref < RX_STALL_MS) return;      // odbior dziala - nic nie rob
+  if (now - lastTry < RX_STALL_MS) return;  // nie czesciej niz raz na 2 min
+  lastTry = now;
+  statRxStalls++;
+
+  Serial.println("ODBIOR: brak ramek > 2 min - pelna reinicjalizacja toru RX");
+  logEventS(LOG_ERROR, "«Brak ramek przez 2 min - restart toru odbioru|No frames for 2 min - restarting receiver»");
+  statRxRestarts++;
+
+  ccInitBase();
+  ccWrite(0x00, 0x06);   // IOCFG2: GDO2 = wskaznik sync word
+  if (rxMode == MODE_FINE_OFFSET) applyFineOffsetMode();
+  else if (rxMode == MODE_VEVOR_7IN1) applyVevorMode();
+  else if (rxMode == MODE_VEVOR_YT60309) applyVevorYT60309Mode();
+  else if (rxMode == MODE_BRESSER) applyBresserMode();
+  else applyCombo(currentFreq, currentProf);
+}
+
+// Wspolna obsluga zdekodowanej ramki VEVOR 7-in-1: liczniki, ostatnie dane,
+// log na port szeregowy i wysylka dalej. Zwraca true, gdy ramka byla poprawna.
+// Wywolywana z dwoch sciezek (bezposredniej i awaryjnej), zeby uniknac duplikacji.
+bool handleVevorFrame(uint8_t* frame, int rssi) {
+  WeatherData w;
+  if (!decodeVevor7in1(frame, 28, w)) return false;
+
+  totalFrames++;
+  w.rssi = rssi;
+  w.t = millis();
+  lastWeather = w;
+  lastWeatherCal = calibrateWeather(w);
+  lastWeatherValid = true;
+  lastDecodedHex = bytesToHex(frame, 28);
+  acceptedFrames++;
+  lastFrameMs = millis();
+  diagPush(frame, 28, rssi, true);
+  publishWeather();
+
+  Serial.print("POGODA ");
+  Serial.print(w.model);
+  Serial.print(" id="); Serial.print(w.id);
+  if (w.haveTemp) { Serial.print(" T="); Serial.print(w.tempC, 1); Serial.print("C"); }
+  if (w.haveHum)  { Serial.print(" RH="); Serial.print(w.humidity); Serial.print("%"); }
+  if (w.haveWind) { Serial.print(" wiatr="); Serial.print(w.windAvgMs, 1); Serial.print("m/s"); }
+  if (w.haveGust) { Serial.print(" poryw="); Serial.print(w.windMaxMs, 1); Serial.print("m/s"); }
+  if (w.haveWindDir) { Serial.print(" dir="); Serial.print(w.windDirDeg); Serial.print("("); Serial.print(windDirText(w.windDirDeg)); Serial.print(")"); }
+  if (w.haveRain) { Serial.print(" deszcz="); Serial.print(w.rainMm, 1); Serial.print("mm"); }
+  if (w.haveUv)   { Serial.print(" UV="); Serial.print(w.uv); Serial.print("/"); Serial.print(w.uvi); }
+  if (w.haveLight){ Serial.print(" lux="); Serial.print(w.lightLux, 0); }
+  Serial.print(" RSSI="); Serial.print(rssi);
+  Serial.print(" hex="); Serial.println(lastDecodedHex);
+  return true;
+}
+
 void loopVevor() {
   static uint8_t rbuf[1024];
   static int rhead = 0, rcount = 0;
 
   radioHealthGuard();
+  rxStallGuard();
 
   // RXBYTES (0x3B): bit 7 = FIFO_OVERFLOW, bity 6:0 = liczba bajtow.
   uint8_t rxBytesRaw = ccStatusRead(0x3B);
@@ -1274,38 +1350,13 @@ void loopVevor() {
     if (sync != 0xCA54) continue;
 
     // Odczytaj 28 bajtów payloadu (224 bity) po sync.
-    uint8_t frame[28];
+    uint8_t payload[28];
     for (int k = 0; k < 28; k++) {
       uint8_t byteVal = 0;
       for (int bit = 0; bit < 8; bit++) byteVal = (uint8_t)((byteVal << 1) | ringBit(b + 16 + k * 8 + bit));
-      frame[k] = byteVal;
+      payload[k] = byteVal;
     }
-    WeatherData w;
-    if (decodeVevor7in1(frame, 28, w)) {
-      totalFrames++;
-      w.rssi = rssi;
-      w.t = millis();
-      lastWeather = w;
-      lastWeatherCal = calibrateWeather(w);
-      lastWeatherValid = true;
-      lastDecodedHex = bytesToHex(frame, 28);
-      acceptedFrames++;
-      diagPush(frame, 28, rssi, true);
-      publishWeather();
-
-      Serial.print("POGODA ");
-      Serial.print(w.model);
-      Serial.print(" id="); Serial.print(w.id);
-      if (w.haveTemp) { Serial.print(" T="); Serial.print(w.tempC, 1); Serial.print("C"); }
-      if (w.haveHum)  { Serial.print(" RH="); Serial.print(w.humidity); Serial.print("%"); }
-      if (w.haveWind) { Serial.print(" wiatr="); Serial.print(w.windAvgMs, 1); Serial.print("m/s"); }
-      if (w.haveGust) { Serial.print(" poryw="); Serial.print(w.windMaxMs, 1); Serial.print("m/s"); }
-      if (w.haveWindDir) { Serial.print(" dir="); Serial.print(w.windDirDeg); Serial.print("("); Serial.print(windDirText(w.windDirDeg)); Serial.print(")"); }
-      if (w.haveRain) { Serial.print(" deszcz="); Serial.print(w.rainMm, 1); Serial.print("mm"); }
-      if (w.haveUv)   { Serial.print(" UV="); Serial.print(w.uv); Serial.print("/"); Serial.print(w.uvi); }
-      if (w.haveLight){ Serial.print(" lux="); Serial.print(w.lightLux, 0); }
-      Serial.print(" RSSI="); Serial.print(rssi);
-      Serial.print(" hex="); Serial.println(lastDecodedHex);
+    if (handleVevorFrame(payload, rssi)) {
       // Wyczyść bufor, żeby nie dekodować tej samej paczki wielokrotnie.
       rcount = 0;
       return;
@@ -1907,7 +1958,10 @@ void publishWeather() {
   // 1) HTTP POST do innego ESP / dowolnego odbiorcy JSON
   if (sendCfg.wifiEnabled && sendCfg.targetUrl.length() > 0 && WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    http.setTimeout(3000);
+    http.setTimeout(1500);          // odczyt odpowiedzi - max 1,5 s
+    http.setConnectTimeout(1500);   // samo nawiazanie - max 1,5 s (bez tego
+                                    // przy nieosiagalnej stacji glównej loop
+                                    // stoi kilka sekund przy kazdej wysylce)
     if (http.begin(sendCfg.targetUrl)) {
       http.addHeader("Content-Type", "application/json");
       int code = http.POST(json);
@@ -2237,7 +2291,10 @@ int radioVersionSamples = 0;  // liczba prób
 void radioHealthCheck() {
   // Pojedynczy odczyt po SPI może czasem zgubić bit, więc czytamy kilka razy
   // i wybieramy wartość dominującą (najczęstszą).
-  int count[256] = {0};
+  // static, zeby 1 kB nie lezal na stosie zadania loopTask (8 kB) - przy
+  // obsludze zadania WWW dochodzilo do przepelnienia stosu i paniki.
+  static int count[256];
+  for (int i = 0; i < 256; i++) count[i] = 0;
   int n = 5;
   for (int i = 0; i < n; i++) {
     count[ccStatusRead(0x31)]++;
@@ -3003,6 +3060,13 @@ void applyWifi() {
   // a znacząco mniejsze zakłócenia dla odbiornika 868 MHz.
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
+  // Wyłącz oszczędzanie energii WiFi. W Arduino-ESP32 dla klasycznego ESP32
+  // domyślnie włączony jest tryb WIFI_PS_MIN_MODEM - przy słabszym łączu
+  // powoduje gubienie beaconów i rozłączanie. To urządzenie jest zasilane
+  // (nie z baterii), więc nie ma po co oszczędzać, a stabilność łącza jest
+  // ważniejsza. Ustawienie musi być PO ustawieniu trybu WiFi.
+  WiFi.setSleep(false);
+
   if (wifiCfg.apPass.length() >= 8) {
     WiFi.softAP(wifiCfg.apSsid.c_str(), wifiCfg.apPass.c_str());
   } else {
@@ -3582,7 +3646,8 @@ String burstScan(float mhz, int secs, bool wide, int agc) {
   // a nie maksimum: wlasne WiFi ESP32 co jakis czas wstrzykuje krotkie skoki
   // RSSI az do -74 dBm na KAZDEJ czestotliwosci i przy kazdym AGC. Progi
   // liczone z maksimum powodowaly, ze te skoki byly brane za sygnal stacji.
-  int base[256];
+  // static: 1 kB poza stosem (patrz komentarz w radioHealthCheck).
+  static int base[256];
   for (int i = 0; i < 256; i++) {
     base[i] = calculateRSSI(ccStatusRead(0x34));
     ccReadFifo(NULL, 64);
@@ -3760,7 +3825,8 @@ String sniffRun(float mhz, float kbaud, bool ook, int agc, int secs) {
   ccStrobe(0x34);
 
   // Mediana szumu (odporna na skoki od wlasnego WiFi ESP32).
-  int base[256];
+  // static: 1 kB poza stosem (patrz komentarz w burstScan).
+  static int base[256];
   for (int i = 0; i < 256; i++) {
     base[i] = calculateRSSI(ccStatusRead(0x34));
     ccReadFifo(NULL, 64);
@@ -4120,6 +4186,98 @@ void handleOtaUpload() {
 // /reboot  - zdalny restart
 
 // Wspólny szablon strony diagnostycznej: ciemny "konsolowy" wygląd + nawigacja.
+// ==================== PLIK ZDROWIA (diagnostyka dlugoterminowa) ====================
+// Po co: do /bledy.log trafiaja TYLKO bledy, a rozlaczenia WiFi i zastoje
+// odbioru byly dotad logowane jako UWAGA (tylko RAM) - po restarcie slad ginal
+// i nie dalo sie ustalic, co sie dzialo przed awaria.
+// Ten plik trzyma historie diagnostyczna: rozlaczenia/ponowne polaczenia WiFi,
+// zastoje odbioru oraz okresowy zapis stanu (co 10 min).
+// Jest ODDZIELNY od /bledy.log, zeby zapis stanu nie wypychal prawdziwych bledow.
+const char* HEALTH_FILE             = "/zdrowie.log";
+const size_t HEALTH_MAX_BYTES       = 4096;      // od tego rozmiaru rotacja
+const size_t HEALTH_KEEP_BYTES      = 2048;      // po rotacji zostaje najnowsze 2 kB
+const unsigned long HEALTH_SNAP_MS  = 600000UL;  // zapis stanu co 10 minut
+
+// Przycina plik zdrowia do najnowszych HEALTH_KEEP_BYTES.
+void healthRotate() {
+  if (!fsReady) return;
+  File f = LittleFS.open(HEALTH_FILE, "r");
+  if (!f) return;
+  if (f.size() <= HEALTH_MAX_BYTES) { f.close(); return; }
+
+  const int MAXKEEP = 80;
+  static String keep[MAXKEEP];   // static: nie na stosie
+  int keepN = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    keep[keepN % MAXKEEP] = line;
+    keepN++;
+  }
+  f.close();
+
+  int total = (keepN < MAXKEEP) ? keepN : MAXKEEP;
+  int first = 0;
+  size_t bytes = 0;
+  for (int i = total - 1; i >= 0; i--) {
+    int idx = (keepN - total + i) % MAXKEEP;
+    if (idx < 0) idx += MAXKEEP;
+    bytes += keep[idx].length() + 1;
+    if (bytes > HEALTH_KEEP_BYTES) { first = i + 1; break; }
+  }
+
+  String out;
+  out.reserve(bytes + 64);
+  for (int i = first; i < total; i++) {
+    int idx = (keepN - total + i) % MAXKEEP;
+    if (idx < 0) idx += MAXKEEP;
+    out += keep[idx];
+    out += '\n';
+  }
+  File w = LittleFS.open(HEALTH_FILE, "w");
+  if (w) { w.print(out); w.close(); }
+  for (int i = 0; i < MAXKEEP; i++) keep[i] = "";
+}
+
+void healthAppend(const String& msg) {
+  if (!fsReady) return;
+  File f = LittleFS.open(HEALTH_FILE, "a");
+  if (!f) return;
+  f.print(timestampStr());
+  f.print(" | #");
+  f.print(rtcBootCount);
+  f.print(" | ");
+  // stripLang: znaczniki «polski|english» nie moga trafic do pliku (tak samo
+  // jak w /bledy.log) - rozbieramy je tutaj, zeby zadne miejsce wywolania
+  // nie musialo o tym pamietac.
+  f.println(stripLang(msg));
+  f.close();
+  healthRotate();
+}
+
+// Okresowy zapis stanu. Jesli urzadzenie kiedys znow sie zablokuje, w tym pliku
+// bedzie widac, jaki byl stan tuz przed awaria (WiFi, sygnal, RAM, zastoje).
+void healthGuard() {
+  static unsigned long lastSnap = 0;
+  unsigned long now = millis();
+  if (lastSnap && (now - lastSnap) < HEALTH_SNAP_MS) return;
+  lastSnap = now;
+
+  String s = "stan: up=" + String((now - startTime) / 1000) + "s";
+  s += " ramki=" + String(acceptedFrames);
+  s += " wiek=" + String(lastWeatherValid ? (long)((now - lastWeather.t) / 1000) : -1L) + "s";
+  s += " wifi=" + String(WiFi.status() == WL_CONNECTED ? "OK" : "BRAK/BRAK");
+  s += " rssiW=" + String(WiFi.RSSI());
+  s += " marc=0x" + String(ccStatusRead(0x35) & 0x1F, HEX);
+  s += " rxStalls=" + String(statRxStalls);
+  s += " reinit=" + String(statRadioReinit);
+  s += " heap=" + String(ESP.getFreeHeap());
+  s += " heapMin=" + String(statHeapMin);
+  s += " maxLoop=" + String(statMaxLoopMs) + "ms";
+  healthAppend(s);
+}
+
 String diagPageStart(const String& title, const String& subPl, const String& subEn, bool autoRefresh) {
   String h;
   h.reserve(1400);
@@ -4151,6 +4309,7 @@ String diagPageStart(const String& title, const String& subPl, const String& sub
        "<a href='/'>📡 «Odczyt|Reading»</a>"
        "<a href='/log'>📋 Log</a>"
        "<a href='/errors'>🚨 «Błędy|Errors»</a>"
+       "<a href='/health'>🩺 «Zdrowie|Health»</a>"
        "<a href='/status'>🩺 Status JSON</a>"
        "<a href='/update'>⬆️ OTA</a>"
        "<a href='/log?raw=1'>⌨️ «Log tekstem|Log as text»</a>"
@@ -4187,6 +4346,7 @@ String buildDiagReport() {
   s += "Predkosc SPI / SPI clk : " + String(gSpiHz / 1000) + " kHz\n";
   s += "RXBYTES (bufor)        : " + String(ccStatusRead(0x3B) & 0x7F) + "\n";
   s += "Reinicjalizacje radia  : " + String(statRadioReinit) + "\n";
+  s += "Zastoje odbioru (2min) : " + String(statRxStalls) + "\n";
   s += "Restarty odbioru       : " + String(statRxRestarts) + "\n";
   s += "Obnizenia SPI          : " + String(statSpiFallback) + "\n";
   s += "\n============= ODBIOR STACJI / WEATHER STATION =============\n";
@@ -4327,6 +4487,68 @@ void handleErrorsPage() {
   server.send(200, "text/html; charset=utf-8", h);
 }
 
+// /health - trwaly plik diagnostyczny (stan, WiFi, zastoje odbioru)
+void handleHealth() {
+  if (server.hasArg("clear")) {
+    if (fsReady) LittleFS.remove(HEALTH_FILE);
+    server.sendHeader("Location", "/health");
+    server.send(303, "text/plain", "");
+    return;
+  }
+
+  String body;
+  body.reserve(4096);
+  size_t fileSize = 0;
+  if (fsReady) {
+    File f = LittleFS.open(HEALTH_FILE, "r");
+    if (f) {
+      fileSize = f.size();
+      while (f.available() && body.length() < 6000) {
+        body += f.readStringUntil('\n');
+        body += '\n';
+      }
+      f.close();
+    }
+  }
+
+  if (server.hasArg("raw")) {
+    server.send(200, "text/plain; charset=utf-8", body);
+    return;
+  }
+
+  String h = diagPageStart("🩺 «Plik zdrowia|Health log file»",
+                           "Historia diagnostyczna: rozłączenia WiFi, zastoje odbioru, stan co 10 min.",
+                           "Diagnostic history: WiFi disconnects, reception stalls, state every 10 min.",
+                           false);
+  h += "<div class='card'>";
+  h += "<span class='lbl'>Zapis / Write:</span> <span class='" +
+       String(fsReady ? "ok'>OK" : "err'>NIEDOSTĘPNY / UNAVAILABLE") + "</span><br>";
+  if (fsReady) {
+    h += "<span class='lbl'>Rozmiar / Size:</span> <span class='val'>" + String(fileSize) +
+         " B</span> <span class='dim'>(rotacja / rotation: " + String(HEALTH_MAX_BYTES) + " B → " +
+         String(HEALTH_KEEP_BYTES) + " B)</span><br>";
+  }
+  h += "<span class='lbl'>Zapis stanu / Snapshot:</span> <span class='val'>co " +
+       String(HEALTH_SNAP_MS / 60000UL) + " min</span>";
+  h += "</div>";
+  h += "<div class='card'>"
+       "<button onclick=\"if(confirm('Skasować plik zdrowia? / Clear health log?'))location='/health?clear=1'\">"
+       "🗑 Skasuj plik / Clear file</button> "
+       "<a href='/health?raw=1'>⌨️ Tekst / Raw</a> "
+       "<a href='/log'>📋 Log zdarzeń / Event log</a>"
+       "</div>";
+  h += "<pre>";
+  if (!fsReady) {
+    h += "LittleFS niedostępny.\nLittleFS unavailable.\n";
+  } else if (body.length() == 0) {
+    h += "(plik pusty - wpis pojawi się po 10 min pracy)\n(empty - first entry after 10 min)\n";
+  } else {
+    h += body;
+  }
+  h += "</pre></body></html>";
+  server.send(200, "text/html; charset=utf-8", h);
+}
+
 // /status - stan w JSON (do skryptów / HA)
 
 void handleStatus() {
@@ -4346,6 +4568,7 @@ void handleStatus() {
   j += "\"spiKhz\":" + String(gSpiHz / 1000) + ",";
   j += "\"radioReinits\":" + String(statRadioReinit) + ",";
   j += "\"rxRestarts\":" + String(statRxRestarts) + ",";
+  j += "\"rxStalls\":" + String(statRxStalls) + ",";
   j += "\"frames\":" + String(diagTotal) + ",";
   j += "\"accepted\":" + String(acceptedFrames) + ",";
   j += "\"rejected\":" + String(rejectedFrames) + ",";
@@ -4487,6 +4710,8 @@ void wifiGuard() {
     if (!wasConnected) {
       wasConnected = true;
       logEventS(LOG_INFO, "«WiFi polaczone|WiFi connected»: " + WiFi.localIP().toString());
+      healthAppend("wifi: polaczono / connected, ip=" + WiFi.localIP().toString() +
+                   " rssi=" + String(WiFi.RSSI()));
     }
     return;
   }
@@ -4494,6 +4719,7 @@ void wifiGuard() {
   if (wasConnected) {
     wasConnected = false;
     logEventS(LOG_WARN, "«WiFi rozlaczone - probuje polaczyc ponownie|WiFi disconnected - reconnecting»");
+    healthAppend("wifi: ROZLACZONE / DISCONNECTED (ostatnie rssi=" + String(WiFi.RSSI()) + ")");
   }
   if (wifiCfg.staSsid.length() == 0) return;      // brak skonfigurowanego STA
   if (millis() - lastAttempt < 20000) return;     // nie częściej niż co 20 s
@@ -4536,8 +4762,16 @@ void setup() {
   Serial.println(resetReasonText(bootResetReason));
   startTime = millis();
   statHeapMin = ESP.getFreeHeap();
+
+  // LittleFS musi wystartować PRZED logowaniem przyczyny restartu - inaczej
+  // komunikaty BROWNOUT/WATCHDOG/PANIC szły do logu w RAM i pliku NIE bylo,
+  // przez co po awarii nie zostawal zaden slad na flashu.
+  errFileBegin();
+
   logEvent(LOG_INFO, String("Start #") + String(rtcBootCount) + ": " +
            String(resetReasonText(bootResetReason)));
+  healthAppend(String("start #") + String(rtcBootCount) + ": " +
+               String(resetReasonText(bootResetReason)));
   if (bootResetReason == ESP_RST_BROWNOUT)
     logEventS(LOG_ERROR, "«BROWNOUT! Slabe zasilanie (kondensator/przewody?)|BROWNOUT! Weak supply (capacitor/wires?)»");
   else if (bootResetReason == ESP_RST_TASK_WDT || bootResetReason == ESP_RST_INT_WDT ||
@@ -4621,8 +4855,9 @@ void setup() {
     Serial.println("Nie polaczono z STA (SSID: " + wifiCfg.staSsid + ")");
   }
 
-  // System plików na błędy + synchronizacja czasu (dla dat w pliku błędów).
-  errFileBegin();
+  // System plików startuje WCZEŚNIEJ (patrz blok przyczyny restartu wyżej) -
+  // inaczej błędy BROWNOUT/WATCHDOG/PANIC nie trafiały do pliku.
+  // Tu tylko synchronizacja czasu (dla dat w pliku błędów).
   timeBegin();
 
   server.on("/", handleRoot);
@@ -4653,6 +4888,7 @@ void setup() {
   server.on("/reboot", handleReboot);
   server.on("/errors", handleErrorsPage);
   server.on("/errtest", handleErrTest);
+  server.on("/health", handleHealth);
   server.begin();
   Serial.println("Web server na porcie 80");
 
@@ -4707,6 +4943,7 @@ void loop() {
   wifiGuard();
   timeGuard();      // synchronizacja czasu (dla dat w pliku błędów)
   heapGuard();      // ochrona RAM przed wyczerpaniem
+  healthGuard();    // co 10 min zapis stanu do /zdrowie.log (diagnostyka)
 
   // Obsługa MQTT (niezależnie od trybu pracy radia)
   mqttEnsureConnected();

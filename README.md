@@ -256,7 +256,7 @@ to trwa).
 >
 > Samo powtórzenie `pio run` może nie wystarczyć. Ten projekt był sprawdzony pod kątem
 > czystego builda (świeży katalog bez `.pio`) na obu środowiskach:
-> `esp32-wroom` → OK (Flash 65,2 %, RAM 19,5 %), `esp32s3` → OK (Flash 37,8 %, RAM 18,9 %).
+> `esp32-wroom` → OK (Flash 65,5 %, RAM 20,9 %), `esp32s3` → OK (Flash 38,0 %, RAM 20,2 %).
 >
 > **Nie buduj tego projektu platformą `espressif32` z rejestru PlatformIO** (to Arduino
 > core 2.x). Instaluje ona framework pod tą samą nazwą i nadpisuje właściwą wersję 3.3.12,
@@ -618,7 +618,7 @@ PlatformIO downloads it on the first build (tens of MB, takes a moment).
 >
 > Simply re-running `pio run` may not help. This project was verified with a clean build
 > (fresh directory, no `.pio`) on both environments:
-> `esp32-wroom` → OK (Flash 65.2 %, RAM 19.5 %), `esp32s3` → OK (Flash 37.8 %, RAM 18.9 %).
+> `esp32-wroom` → OK (Flash 65.5 %, RAM 20.9 %), `esp32s3` → OK (Flash 38.0 %, RAM 20.2 %).
 >
 > **Do not build this project with the registry `espressif32` platform** (that is Arduino
 > core 2.x). It installs the framework under the same name and overwrites the correct
