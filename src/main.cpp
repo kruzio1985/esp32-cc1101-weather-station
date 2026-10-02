@@ -3090,12 +3090,18 @@ void applyWifi() {
   // a znacząco mniejsze zakłócenia dla odbiornika 868 MHz.
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
-  // Wyłącz oszczędzanie energii WiFi. W Arduino-ESP32 dla klasycznego ESP32
-  // domyślnie włączony jest tryb WIFI_PS_MIN_MODEM - przy słabszym łączu
-  // powoduje gubienie beaconów i rozłączanie. To urządzenie jest zasilane
-  // (nie z baterii), więc nie ma po co oszczędzać, a stabilność łącza jest
-  // ważniejsza. Ustawienie musi być PO ustawieniu trybu WiFi.
-  WiFi.setSleep(false);
+  // UWAGA: celowo NIE wyłączamy tu oszczędzania energii WiFi (WiFi.setSleep(false)).
+  // Włączono to 2026-09-27 i WYCOFANO 2026-10-02, bo:
+  //  - tryb bez oszczędzania podnosi średni pobór prądu (modem WiFi nie zasypia
+  //    między beaconami), a to urządzenie dzieli linię 5 V ze stacją pogodową
+  //    (pierścień 36x WS2812B) - przy marginalnym zasilaniu kończyło się to
+  //    restartami BROWNOUT (46 restartów z rzędu),
+  //  - wydłuża czas pracy nadajnika WiFi, co dokłada zakłóceń odbiornikowi 868 MHz.
+  // Domyślny tryb WIFI_PS_MIN_MODEM jest tu bezpieczny: sygnał ma duży zapas
+  // (RSSI ok. -50 dBm), więc gubienie beaconów nie występuje.
+  //
+  // Mocy nadawania NIE obniżamy: 2 dBm okazało się za słabe przy OTA (2026-09-27),
+  // a 8,5 dBm jest sprawdzone. Na czas OTA moc i tak wzrasta do 19,5 dBm.
 
   if (wifiCfg.apPass.length() >= 8) {
     WiFi.softAP(wifiCfg.apSsid.c_str(), wifiCfg.apPass.c_str());
