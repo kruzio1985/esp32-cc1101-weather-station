@@ -453,7 +453,10 @@ esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
 // Sprzętowy watchdog zadania (TWDT). Jeśli loop() nie "nakarmi" go przez
 // WDT_TIMEOUT_S sekund, ESP restartuje się sam. Chroni przed zawieszeniem
 // (np. zakleszczeniem na SPI albo nieskończoną pętlą).
-const uint32_t WDT_TIMEOUT_S = 30;
+// 10 s, nie 30: najdłuższa legalna operacja bez karmienia watchdoga to wysyłka
+// HTTP (1,5 s łączenie + 1,5 s odczyt = 3 s), więc 10 s daje ~3x zapasu,
+// a zawieszenie jest wykrywane 3x szybciej.
+const uint32_t WDT_TIMEOUT_S = 10;
 bool wdtEnabled = false;
 
 void wdtBegin() {
@@ -535,8 +538,11 @@ void errFileRotate(bool force) {
   if (ntpSynced) { time(&now); oldest = now - (time_t)ERR_KEEP_DAYS * 86400; }
 
   // Bufor na zachowane linie (nowe na koncu).
+  // UWAGA: static, nie na stosie! 120 x sizeof(String) = ~1920 B, a stos
+  // loopTask ma 8 kB i jest dzielony z obsluga WWW (ta sama przyczyna, dla
+  // ktorej healthRotate() ma tu `static`).
   const int MAXKEEP = 120;
-  String keep[MAXKEEP];
+  static String keep[MAXKEEP];
   int keepN = 0;
   size_t keptBytes = 0;
 
@@ -737,8 +743,17 @@ uint8_t ccStatusRead(uint8_t reg) {
 // TRWALE blokuje CC1101 - potwierdzone testem: po 5 odczytach burst radio
 // przestaje odpowiadać po SPI (VERSION zwraca śmieci). Działający firmware
 // referencyjny czyta FIFO pojedynczymi odczytami (CS nisko tylko ~20 us).
+// Odczyt z FIFO. `buf == NULL` oznacza "tylko opróżnij FIFO" - tak robi
+// diagnostyka (/burst, /sniff), gdzie bajty trzeba wyrzucić, żeby radio nie
+// weszło w RXFIFO_OVERFLOW, ale ich treść nie jest potrzebna.
+// UWAGA: bez tej gałęzi `buf[i] = ...` pisało pod adres 0x0 -> StoreProhibited
+// -> panic i restart urządzenia przy każdym wywołaniu /burst albo /sniff.
 int ccReadFifo(uint8_t* buf, int n) {
-  for (int i = 0; i < n; i++) buf[i] = ccRead(0x3F);
+  if (buf) {
+    for (int i = 0; i < n; i++) buf[i] = ccRead(0x3F);
+  } else {
+    for (int i = 0; i < n; i++) (void)ccRead(0x3F);
+  }
   return n;
 }
 
@@ -1193,7 +1208,14 @@ void radioHealthGuard() {
   logEventS(LOG_ERROR, "«CC1101 nie odpowiada po SPI - reinicjalizacja|CC1101 not responding over SPI - reinitialising»");
   statRadioReinit++;
   ccInitBase();
-  applyVevorMode();
+  // Przywroc AKTUALNY tryb odbioru, nie zawsze VEVOR: w pozostalych trybach
+  // (AUTO, FineOffset, YT60309, Bresser) przelaczenie na VEVOR czynilo odbior
+  // bezuzytecznym az do restartu.
+  if (rxMode == MODE_FINE_OFFSET) applyFineOffsetMode();
+  else if (rxMode == MODE_VEVOR_7IN1) applyVevorMode();
+  else if (rxMode == MODE_VEVOR_YT60309) applyVevorYT60309Mode();
+  else if (rxMode == MODE_BRESSER) applyBresserMode();
+  else applyCombo(currentFreq, currentProf);
 }
 
 // ==================== WATCHDOG ODBIORU ====================
@@ -1267,8 +1289,10 @@ void loopVevor() {
   static uint8_t rbuf[1024];
   static int rhead = 0, rcount = 0;
 
-  radioHealthGuard();
-  rxStallGuard();
+  // UWAGA: radioHealthGuard() i rxStallGuard() sa wolane z loop() dla WSZYSTKICH
+  // trybow odbioru. Wczesniej byly tylko tutaj, czyli wylacznie w trybie VEVOR -
+  // w trybach AUTO / FineOffset / YT60309 / Bresser radio nie mialo ZADNEGO
+  // samo-naprawiania i po zakleszczeniu zostawalo gluche az do restartu.
 
   // RXBYTES (0x3B): bit 7 = FIFO_OVERFLOW, bity 6:0 = liczba bajtow.
   uint8_t rxBytesRaw = ccStatusRead(0x3B);
@@ -1933,10 +1957,32 @@ void mqttEnsureConnected() {
 void applyMqtt() {
   if (mqttCfg.enabled && mqttCfg.broker.length() > 0) {
     mqtt.setServer(mqttCfg.broker.c_str(), mqttCfg.port);
+    // PubSubClient domyslnie czeka 15 s (MQTT_SOCKET_TIMEOUT) na gniazdo -
+    // przy niedostepnym brokerze mqtt.connect() blokowalby petle tak dlugo.
+    // 3 s wystarcza dla brokera w sieci lokalnej.
+    mqtt.setSocketTimeout(3);
     mqttClientId = "";   // wymuś nowe client-id po zmianie konfiguracji
   } else {
     mqtt.disconnect();
   }
+}
+
+// Czy w adresie wysylki host jest DOSLOWNYM adresem IPv4? HTTPClient nie pozwala
+// ograniczyc czasu rozwiazywania nazwy DNS - NetworkClient::connect() przekazuje
+// limit setConnectTimeout() tylko do samego polaczenia TCP, a rozwijanie nazwy
+// idzie przez lwip_getaddrinfo() bez zadnego limitu. Przy niedostepnym DNS
+// potrafi to zablokowac petle na kilkanascie sekund, czyli powyzej progu
+// watchdoga (10 s) -> restart, i to w kolko. Dlatego ostrzegamy w logu.
+static bool urlHostIsLiteralIp(const String& url) {
+  int p = url.indexOf("://");
+  if (p < 0) return false;
+  int h = p + 3;
+  int e = url.indexOf('/', h);
+  String host = (e < 0) ? url.substring(h) : url.substring(h, e);
+  int c = host.indexOf(':');
+  if (c >= 0) host = host.substring(0, c);
+  IPAddress ip;
+  return ip.fromString(host);
 }
 
 void applySend() {
@@ -1950,6 +1996,9 @@ void applySend() {
     Serial.println("RS485: TX=" + String(sendCfg.rs485TxPin) + " RX=" + String(sendCfg.rs485RxPin) +
                    " baud=" + String(sendCfg.rs485Baud) + " DE=" + String(sendCfg.rs485DePin));
   }
+  if (sendCfg.wifiEnabled && sendCfg.targetUrl.length() > 0 && !urlHostIsLiteralIp(sendCfg.targetUrl)) {
+    logEventS(LOG_WARN, "«Adres wysylki to nazwa, nie adres IP - DNS moze zablokowac petle, uzyj IP|Send URL is a hostname, not an IP - DNS may stall the loop, use an IP»: " + sendCfg.targetUrl);
+  }
 }
 
 // Backoff wysyłki HTTP. Każda próba blokuje pętlę do ~1,5 s, więc gdy stacja
@@ -1958,7 +2007,9 @@ void applySend() {
 // SEND_BACKOFF_MS. Nic przy tym nie tracimy: stacja główna SAMA odpytuje nasz
 // /json (extdev, co 20 s), więc wysyłka jest tylko dodatkowym kanałem.
 const int SEND_FAIL_LIMIT = 3;
-const unsigned long SEND_BACKOFF_MS = 300000UL;   // 5 minut
+// 1 minuta, nie 5: przy 5 minutach każda seria 3 błędów robiła 5-minutową dziurę
+// w danych (dokładnie to widział użytkownik jako "radio nie działa").
+const unsigned long SEND_BACKOFF_MS = 60000UL;    // 1 minuta
 int sendFailRun = 0;
 unsigned long sendSkipUntil = 0;
 
@@ -1973,6 +2024,9 @@ void publishWeather() {
     if (millis() < sendSkipUntil) {
       // Trwa przerwa po nieudanych próbach - pomijamy (bez blokowania pętli).
     } else {
+      // Karm watchdoga tuz przed proba: rozwiazanie nazwy DNS NIE podlega
+      // limitom HTTPClient, wiec pelny budzet 10 s startuje od tego miejsca.
+      wdtFeed();
       HTTPClient http;
       http.setTimeout(1500);          // odczyt odpowiedzi - max 1,5 s
       http.setConnectTimeout(1500);   // samo nawiazanie - max 1,5 s (bez tego
@@ -1998,9 +2052,10 @@ void publishWeather() {
       } else if (++sendFailRun >= SEND_FAIL_LIMIT) {
         sendSkipUntil = millis() + SEND_BACKOFF_MS;
         sendFailRun = 0;
-        logEventS(LOG_WARN, "«Wysylka HTTP nie dziala - przerwa 5 min|HTTP sending failed - pausing 5 min»: " +
+        const unsigned long backoffMin = SEND_BACKOFF_MS / 60000UL;
+        logEventS(LOG_WARN, "«Wysylka HTTP nie dziala - przerwa " + String(backoffMin) + " min|HTTP sending failed - pausing " + String(backoffMin) + " min»: " +
                            sendCfg.targetUrl);
-        healthAppend("http: " + String(SEND_FAIL_LIMIT) + " bledow z rzedu, przerwa 5 min (" + sendCfg.targetUrl + ")");
+        healthAppend("http: " + String(SEND_FAIL_LIMIT) + " bledow z rzedu, przerwa " + String(backoffMin) + " min (" + sendCfg.targetUrl + ")");
       }
     }
   }
@@ -2769,7 +2824,7 @@ void handleRoot() {
   html += R"(</b> &nbsp;|&nbsp; «Startów|Boots»: <b id="sys-boots">)";
   html += String(rtcBootCount);
   html += R"(</b> &nbsp;|&nbsp; Watchdog: <b id="sys-wdt">)";
-  html += wdtEnabled ? "włączony (30 s)" : "WYŁĄCZONY";
+  html += wdtEnabled ? ("włączony (" + String(WDT_TIMEOUT_S) + " s)") : "WYŁĄCZONY";
   html += R"(</b> &nbsp;|&nbsp; «Restarty WDT|WDT resets»: <b style="color:#ff6b6b">)";
   html += String(rtcWdtResets);
   html += R"(</b> &nbsp;|&nbsp; Brownout: <b style="color:#ffb84d">)";
@@ -2879,7 +2934,7 @@ function refreshSys() {
       setText('sys-maxloop', s.maxLoopMs);
       var w = document.getElementById('sys-wdt');
       if (w) {
-        w.textContent = (s.watchdogEnabled ? 'włączony (30 s)' : 'WYŁĄCZONY') +
+        w.textContent = (s.watchdogEnabled ? 'włączony (' + s.wdtTimeoutS + ' s)' : 'WYŁĄCZONY') +
                         ' | WDT: ' + s.wdtResets + ' | brownout: ' + s.brownouts +
                         ' | crash: ' + s.panics;
       }
@@ -3084,11 +3139,15 @@ void applyWifi() {
   // to odcinało dostęp do urządzenia.
   WiFi.mode(WIFI_AP_STA);
 
-  // Obniż moc nadawczą WiFi (po ustawieniu trybu!). Pełna moc ESP32 (~20 dBm)
-  // wstrzykuje krótkie skoki szumu do CC1101 i maskuje słabsze sygnały stacji.
-  // 8.5 dBm to ~50% mocy - wystarczające na kilkanaście metrów do routera,
-  // a znacząco mniejsze zakłócenia dla odbiornika 868 MHz.
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  // Moc nadawcza WiFi - kompromis między jakością łącza a zakłóceniami CC1101.
+  // Pełna moc ESP32 (19,5 dBm) wstrzykuje skoki szumu do odbiornika 868 MHz,
+  // dlatego nadajemy poniżej maksimum. 8,5 dBm okazało się JEDNAK ZA SŁABE
+  // (2026-10-03): przy RSSI odbioru -56..-58 dBm tor nadawczy jest o ~11 dB
+  // słabszy niż stacji głównej, co dawało serie timeoutów połączenia
+  // (dokładnie 1,5 s = limit connectu) w OBIE strony i 5-minutowe dziury
+  // w danych. 15 dBm dodaje +6,5 dB zapasu łącza, a zakłócenie dla 868 MHz
+  // pozostaje wyraźnie niższe niż przy pełnej mocy.
+  WiFi.setTxPower(WIFI_POWER_15dBm);
 
   // UWAGA: celowo NIE wyłączamy tu oszczędzania energii WiFi (WiFi.setSleep(false)).
   // Włączono to 2026-09-27 i WYCOFANO 2026-10-02, bo:
@@ -3097,8 +3156,10 @@ void applyWifi() {
   //    (pierścień 36x WS2812B) - przy marginalnym zasilaniu kończyło się to
   //    restartami BROWNOUT (46 restartów z rzędu),
   //  - wydłuża czas pracy nadajnika WiFi, co dokłada zakłóceń odbiornikowi 868 MHz.
-  // Domyślny tryb WIFI_PS_MIN_MODEM jest tu bezpieczny: sygnał ma duży zapas
-  // (RSSI ok. -50 dBm), więc gubienie beaconów nie występuje.
+  // Domyślny tryb WIFI_PS_MIN_MODEM zostaje. UWAGA: uzasadnienie "RSSI ok. -50 dBm"
+  // było nieaktualne - zmierzone RSSI to -56..-58 dBm. Jeśli po podniesieniu mocy
+  // nadawczej łącze NADAL będzie gubiło połączenia, następnym krokiem jest
+  // WiFi.setSleep(false) (wymaga zapasu prądu na linii 5 V).
   //
   // Mocy nadawania NIE obniżamy: 2 dBm okazało się za słabe przy OTA (2026-09-27),
   // a 8,5 dBm jest sprawdzone. Na czas OTA moc i tak wzrasta do 19,5 dBm.
@@ -3712,7 +3773,11 @@ String burstScan(float mhz, int secs, bool wide, int agc) {
   unsigned long burstStart = 0, lastEnd = 0;
   String durs = "", gaps = "";
 
-  unsigned long endUs = micros() + (unsigned long)secs * 1000000UL;
+  // Porownujemy ROZNICE czasu, nie znaczniki: micros() jest 32-bitowe i zawija
+  // sie co ~71 min. Przy zapisie `micros() + secs*1e6` po zawinieciu warunek
+  // konca byl spelniony od razu i skan konczyl sie natychmiast (falszywy wynik).
+  const unsigned long startUs = micros();
+  const unsigned long durUs = (unsigned long)secs * 1000000UL;
   while (true) {
     wdtFeed();   // dluga operacja - nie pozwol watchdogowi zrestartowac
     int r = calculateRSSI(ccStatusRead(0x34));
@@ -3754,7 +3819,7 @@ String burstScan(float mhz, int secs, bool wide, int agc) {
         ccReadFifo(tmp, n2);
         drained += n2;
       }
-      if (micros() >= endUs) break;
+      if ((unsigned long)(micros() - startUs) >= durUs) break;
     }
   }
   if (inBurst && bursts <= 10) durs += String((micros() - burstStart) / 1000UL) + "ms ";
@@ -3786,7 +3851,10 @@ void handleBurst() {
   }
   int secs = server.hasArg("sec") ? server.arg("sec").toInt() : 30;
   if (secs < 5) secs = 5;
-  if (secs > 300) secs = 300;
+  // Max 60 s, nie 300: skan blokuje caly loop() (radio + strona www) i KARMI
+  // watchdoga, wiec w tym czasie urzadzenie nie ma auto-restartu. Krotszy limit
+  // ogranicza okno, w ktorym zawieszenie SPI nie zostanie wykryte.
+  if (secs > 60) secs = 60;
 
   // Opcjonalnie wylacz WiFi na czas pomiaru: wlasne WiFi ESP32 wstrzykuje
   // krotkie skoki RSSI (~ -74 dBm) na kazdej czestotliwosci i maskuje
@@ -3878,10 +3946,12 @@ String sniffRun(float mhz, float kbaud, bool ook, int agc, int secs) {
   out += ook ? "OOK " : "FSK ";
   out += "agc=0x" + String(agc, HEX) + " szumMed=" + String(noiseMed) + " prog=" + String(thrHi) + "dBm";
 
-  unsigned long tEnd = micros() + (unsigned long)secs * 1000000UL;
+  // Roznica czasu, nie znacznik - patrz komentarz w burstScan() (zawijanie micros()).
+  const unsigned long tStart = micros();
+  const unsigned long tDur = (unsigned long)secs * 1000000UL;
   int found = 0;
   long guard = 0;
-  while (found < 3 && micros() < tEnd) {
+  while (found < 3 && (unsigned long)(micros() - tStart) < tDur) {
     wdtFeed();   // dluga operacja - nie pozwol watchdogowi zrestartowac
     int r = calculateRSSI(ccStatusRead(0x34));
     // Bez ciaglego oprozniania FIFO radio wchodzi w RXFIFO_OVERFLOW i RSSI
@@ -3912,7 +3982,7 @@ String sniffRun(float mhz, float kbaud, bool ook, int agc, int secs) {
       }
     }
 
-    out += "\n  #" + String(found) + " t=" + String((tb - (tEnd - (unsigned long)secs * 1000000UL)) / 1000UL) + "ms bajtow=" + String(blen) + " marc=0x" + String(marcMin, HEX) + " : ";
+    out += "\n  #" + String(found) + " t=" + String((tb - tStart) / 1000UL) + "ms bajtow=" + String(blen) + " marc=0x" + String(marcMin, HEX) + " : ";
     for (int i = 0; i < blen; i++) {
       if (sniffBuf[i] < 0x10) out += '0';
       out += String(sniffBuf[i], HEX);
@@ -3937,7 +4007,8 @@ void handleSniff() {
   float kbaud = server.hasArg("kbaud") ? server.arg("kbaud").toFloat() : 11.11;
   int secs = server.hasArg("sec") ? server.arg("sec").toInt() : 45;
   if (secs < 10) secs = 10;
-  if (secs > 300) secs = 300;
+  // Max 60 s - patrz komentarz w handleBurst().
+  if (secs > 60) secs = 60;
   int agc = server.hasArg("agc") ? (int)strtol(server.arg("agc").c_str(), NULL, 0) : 0x03;
 
   bool wifiWasOn = (WiFi.getMode() != WIFI_OFF);
@@ -4158,6 +4229,17 @@ void handleSpiTest() {
   s += "6) VERSION x8: ";
   for (int i = 0; i < 8; i++) { s += "0x" + String(ccStatusRead(0x31), HEX) + " "; delay(3); }
 
+  // SRES przywrocil uklad do ustawien fabrycznych (~800 MHz, inny pakiet).
+  // Bez ponownego ustawienia trybu radio zostaje GLUCHE az do restartu.
+  ccInitBase();
+  if (rxMode == MODE_FINE_OFFSET) applyFineOffsetMode();
+  else if (rxMode == MODE_VEVOR_7IN1) applyVevorMode();
+  else if (rxMode == MODE_VEVOR_YT60309) applyVevorYT60309Mode();
+  else if (rxMode == MODE_BRESSER) applyBresserMode();
+  else applyCombo(currentFreq, currentProf);
+  s += "7) tryb odbioru przywrocony po SRES: MARCSTATE=0x";
+  s += String(ccStatusRead(0x35) & 0x1F, HEX) + "\n";
+
   Serial.println(s);
   server.send(200, "text/plain; charset=utf-8", s);
 }
@@ -4200,6 +4282,12 @@ void handleOtaUpload() {
       Update.printError(Serial);
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
+    // Karm watchdog przy realnym postepie przesylu. Przeslanie ~1,3 MB trwa
+    // kilkanascie sekund i blokuje loop() na caly ten czas, wiec bez tego
+    // watchdog (10 s) przerywa OTA w polowie (i urzadzenie wraca do starego
+    // firmware). Karmimy TYLKO gdy przyszly dane, zeby zawieszony transfer
+    // nie zamaskowal zawieszenia na zawsze.
+    if (upload.currentSize) wdtFeed();
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       Update.printError(Serial);
     }
@@ -4210,7 +4298,7 @@ void handleOtaUpload() {
       Update.printError(Serial);
     }
     // Przywróć normalną (umiarkowaną) moc - nie zagłuszać radia po restarcie.
-    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    WiFi.setTxPower(WIFI_POWER_15dBm);
   }
 }
 
@@ -4597,6 +4685,7 @@ void handleStatus() {
   j += "\"panics\":" + String(rtcPanics) + ",";
   j += "\"hangResets\":" + String(rtcHangResets) + ",";
   j += "\"watchdogEnabled\":" + String(wdtEnabled ? "true" : "false") + ",";
+  j += "\"wdtTimeoutS\":" + String(WDT_TIMEOUT_S) + ",";
   j += "\"radioVersion\":" + String(ccStatusRead(0x31)) + ",";
   j += "\"radioOk\":" + String(ccStatusRead(0x31) == 0x14 ? "true" : "false") + ",";
   j += "\"marcState\":" + String(ccStatusRead(0x35) & 0x1F) + ",";
@@ -4934,7 +5023,7 @@ void setup() {
   logEventS(LOG_INFO, "«System gotowy - nasluch uruchomiony|System ready - listening started»");
   // Watchdog startuje NA KOŃCU setup - od tego momentu loop() musi go karmić.
   wdtBegin();
-  Serial.println(wdtEnabled ? "Watchdog: wlaczony (30 s)" : "Watchdog: NIE udalo sie wlaczyc");
+  Serial.println(wdtEnabled ? ("Watchdog: wlaczony (" + String(WDT_TIMEOUT_S) + " s)") : "Watchdog: NIE udalo sie wlaczyc");
 }
 
 
@@ -4980,6 +5069,10 @@ void loop() {
   timeGuard();      // synchronizacja czasu (dla dat w pliku błędów)
   heapGuard();      // ochrona RAM przed wyczerpaniem
   healthGuard();    // co 10 min zapis stanu do /zdrowie.log (diagnostyka)
+  // Nadzór nad radiem - dla WSZYSTKICH trybow odbioru (w trybach probe/capture
+  // loop() wychodzi wyzej, bo tam celowo zmieniamy ustawienia radia).
+  radioHealthGuard();   // czy CC1101 odpowiada po SPI
+  rxStallGuard();       // czy w ogole przychodza ramki (2 min bez ramki = restart toru)
 
   // Obsługa MQTT (niezależnie od trybu pracy radia)
   mqttEnsureConnected();
