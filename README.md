@@ -305,9 +305,16 @@ Plik `firmware.bin` powstaje po `pio run -e esp32-wroom` w katalogu
   w pamięci NVS urządzenia — **nie wpisuj ich w kodzie źródłowym** (ten plik może trafić na
   publiczne repozytorium).
 
-> **Moc WiFi:** firmware celowo obniża moc nadawczą WiFi do 2 dBm. Pełna moc ESP32
-> (~20 dBm) wstrzykiwała szum do CC1101 i zagłuszała słabe ramki stacji pogodowej
-> (RSSI spadało o ~12 dB). 2 dBm w zupełności wystarcza na kilka metrów do routera.
+> **Moc i uśpienie WiFi:** firmware nadaje z mocą **15 dBm** i **wyłącza uśpienie modemu WiFi**
+> (`WiFi.setSleep(false)`). Historia dojścia do tego: **2 dBm** okazało się za słabe (nie
+> przechodziło OTA), **8,5 dBm** dawało serie timeoutów połączenia ze stacją główną, a pełna moc
+> ESP32 (~20 dBm) wstrzykiwała szum do CC1101 i zagłuszała słabe ramki stacji pogodowej
+> (RSSI spadało o ~12 dB). **15 dBm** to kompromis: łącze ma zapas, a zakłócenie 868 MHz
+> pozostaje wyraźnie niższe niż przy pełnej mocy (na czas OTA moc chwilowo rośnie do 19,5 dBm).
+> **Uśpienie modemu wyłączono 2026-10-04** — dodawało ~100 ms opóźnień (DTIM 102,4 ms) i gubiło
+> pakiety, przez co stacja główna odnotowywała timeouts (1,5 s) i wpadała w 5-minutowe przerwy
+> w danych. Jeśli po tej zmianie pojawią się brownouty, firmware **sam włączy uśpienie z powrotem**
+> (ochrona zasilania). Aktualny stan widać w `/status` jako pole `wifiSleep`.
 
 > **Uwaga:** wgranie scalonego obrazu `firmware.factory.bin` od adresu `0x0`
 > (np. `esptool write-flash 0x0 firmware.factory.bin`) **kasuje NVS** — tracisz
@@ -667,9 +674,16 @@ by `pio run -e esp32-wroom` at `.pio/build/esp32-wroom/firmware.bin`.
   device's NVS memory — **do not put them in the source code** (this file may end up in a public
   repository).
 
-> **WiFi power:** the firmware deliberately lowers the WiFi TX power to 2 dBm. Full ESP32
+> **WiFi power and sleep:** the firmware transmits at **15 dBm** and **disables WiFi modem sleep**
+> (`WiFi.setSleep(false)`). How we got here: **2 dBm** was too weak (OTA failed),
+> **8.5 dBm** caused bursts of connection timeouts towards the main station, and full ESP32
 > power (~20 dBm) injected noise into the CC1101 and masked the station's weak frames
-> (RSSI dropped by ~12 dB). 2 dBm is plenty for a router a few meters away.
+> (RSSI dropped by ~12 dB). **15 dBm** is the compromise: the link has margin while the
+> 868 MHz interference stays well below full-power levels (during OTA the power temporarily
+> rises to 19.5 dBm). **Modem sleep was disabled on 2026-10-04** — it added ~100 ms latency
+> (DTIM 102.4 ms) and dropped packets, which made the main station log timeouts (1.5 s) and
+> enter 5-minute data gaps. If brownouts appear after this change, the firmware **re-enables
+> sleep automatically** (power protection). Current state is shown in `/status` as `wifiSleep`.
 
 > **Note:** flashing a merged `firmware.factory.bin` from address `0x0`
 > (e.g. `esptool write-flash 0x0 firmware.factory.bin`) **erases NVS** — you lose
