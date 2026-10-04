@@ -3132,6 +3132,9 @@ void saveWifiCfg() {
   wifiPrefs.end();
 }
 
+// Stan oszczędzania energii WiFi - do /status (ustawiany w applyWifi()).
+bool gWifiSleepOn = false;
+
 void applyWifi() {
   // AP ZAWSZE włączony + równoległe połączenie z siecią domową (STA).
   // Dzięki temu urządzenie jest ZAWSZE osiągalne pod 192.168.4.1 (AP), nawet
@@ -3149,17 +3152,27 @@ void applyWifi() {
   // pozostaje wyraźnie niższe niż przy pełnej mocy.
   WiFi.setTxPower(WIFI_POWER_15dBm);
 
-  // UWAGA: celowo NIE wyłączamy tu oszczędzania energii WiFi (WiFi.setSleep(false)).
-  // Włączono to 2026-09-27 i WYCOFANO 2026-10-02, bo:
-  //  - tryb bez oszczędzania podnosi średni pobór prądu (modem WiFi nie zasypia
-  //    między beaconami), a to urządzenie dzieli linię 5 V ze stacją pogodową
-  //    (pierścień 36x WS2812B) - przy marginalnym zasilaniu kończyło się to
-  //    restartami BROWNOUT (46 restartów z rzędu),
-  //  - wydłuża czas pracy nadajnika WiFi, co dokłada zakłóceń odbiornikowi 868 MHz.
-  // Domyślny tryb WIFI_PS_MIN_MODEM zostaje. UWAGA: uzasadnienie "RSSI ok. -50 dBm"
-  // było nieaktualne - zmierzone RSSI to -56..-58 dBm. Jeśli po podniesieniu mocy
-  // nadawczej łącze NADAL będzie gubiło połączenia, następnym krokiem jest
-  // WiFi.setSleep(false) (wymaga zapasu prądu na linii 5 V).
+  // Oszczędzanie energii WiFi - WYŁĄCZONE od 2026-10-04.
+  // Pomiar (ping 100 pakietów do sniffera, 04.10.2026): min 21 ms, średnia 97 ms,
+  // skoki do 1255 ms i 11-17% strat pakietów przy RSSI -50 dBm. Opóźnienia układają
+  // się w wielokrotność DTIM (102,4 ms) - to modem WiFi zasypiający między beaconami.
+  // Skutek: zgubiony pakiet SYN wydłużał połączenie do > 1,5 s, czyli ponad limit
+  // stacji głównej (setConnectTimeout(1500)); ta liczyła to jako błąd i po 3 błędach
+  // wpadała w 5-minutowy backoff - dane zamarzały na 6 minut (objaw "radio się
+  // zawiesiło"). Bez oszczędzania opóźnienie spada do kilku ms.
+  // HISTORIA: próba z 27.09 wycofana 02.10 - bez oszczędzania średni pobór rósł
+  // o ~40 mA, co przy marginalnej linii 5 V dało 46 brownoutów z rzędu.
+  // Dlatego jest bezpiecznik: gdy brownouty wrócą, uśpienie włącza się samo.
+  if (rtcBrownouts >= 3 || bootResetReason == ESP_RST_BROWNOUT) {
+    WiFi.setSleep(true);
+    gWifiSleepOn = true;
+    Serial.println("WiFi: oszczedzanie energii WLACZONE (wykryto brownouty - ochrona zasilania)");
+    logEventS(LOG_WARN, "«Brownouty - przywrocono oszczedzanie energii WiFi|Brownouts detected - WiFi power save restored»");
+  } else {
+    WiFi.setSleep(false);
+    gWifiSleepOn = false;
+    Serial.println("WiFi: oszczedzanie energii WYLACZONE (stale lacze, male opoznienia)");
+  }
   //
   // Mocy nadawania NIE obniżamy: 2 dBm okazało się za słabe przy OTA (2026-09-27),
   // a 8,5 dBm jest sprawdzone. Na czas OTA moc i tak wzrasta do 19,5 dBm.
@@ -4686,6 +4699,7 @@ void handleStatus() {
   j += "\"hangResets\":" + String(rtcHangResets) + ",";
   j += "\"watchdogEnabled\":" + String(wdtEnabled ? "true" : "false") + ",";
   j += "\"wdtTimeoutS\":" + String(WDT_TIMEOUT_S) + ",";
+  j += "\"wifiSleep\":" + String(gWifiSleepOn ? "true" : "false") + ",";
   j += "\"radioVersion\":" + String(ccStatusRead(0x31)) + ",";
   j += "\"radioOk\":" + String(ccStatusRead(0x31) == 0x14 ? "true" : "false") + ",";
   j += "\"marcState\":" + String(ccStatusRead(0x35) & 0x1F) + ",";
