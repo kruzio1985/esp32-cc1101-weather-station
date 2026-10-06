@@ -1006,9 +1006,21 @@ void applyVevorMode() {
   ccStrobe(0x36);  // SIDLE
   ccStrobe(CC_SFRX);  // SFRX
 
-  ccWriteFreq(0x21, 0x65, 0x6A);  // 868.30 MHz (Twoja stacja)
+  // CZESTOTLIWOSC: 868.37 MHz, nie 868.30!
+  // POMIAR 2026-10-06 (/sniff + analiza bitowa): czujnik nadaje na ~868.40-868.44 MHz,
+  // a odbiornik sluchal na 868.30 MHz. Roznica ~100 kHz wypadala POZA filtr 162.5 kHz
+  // (+-81 kHz), wiec odbierany byl tylko skraj filtra: RSSI spadlo z -58 do -74 dBm,
+  // dyskriminator FSK dawal stronniczy strumien (61.8% jedynek), a sync CA54 nie
+  // trafial - ramki znikaly (1 na ~100 s zamiast co 20 s), mimo ze radio bylo zdrowe.
+  // Dodatkowo dryf zalezy od temperatury (~13 ppm/^C), co dawalo wzorzec dzien/noc:
+  // 06.10 10:48-18:42 (cieplo) 8 godzin bez zaniku, noce - sypalo sie.
+  // Dlatego srodek pasma przesuniety na 868.37, a szerokosc ZWIEKSZONA do 271 kHz,
+  // zeby w pasmie zmiescilo sie i 868.30 (stan cieply), i 868.44 (stan zimny).
+  ccWriteFreq(0x21, 0x66, 0x1A);  // 868.37 MHz
 
-  ccWrite(0x10, 0x98);  // MDMCFG4: rate ~11.11k, BW 162.5 kHz
+  // MDMCFG4 = 0x68: CHANBW_E=1, CHANBW_M=2 -> BW 271 kHz (bylo 0x98 -> 162.5 kHz),
+  // DRATE_E=8 bez zmian (przepustowosc pozostaje ~11.11 kbaud z MDMCFG3=0xC0).
+  ccWrite(0x10, 0x68);  // MDMCFG4: rate ~11.11k, BW 271 kHz (poszerzone pod dryf)
   ccWrite(0x11, 0xC0);  // MDMCFG3: DRATE_M=192 -> ~11.11 kbaud
   // UWAGA (sprawdzone na sprzęcie 2026-09-27): próbowano tu SPRZĘTOWEGO sync
   // word (SYNC1=0xCA, SYNC0=0x54, MDMCFG2=0x02, stała długość 28 B), żeby
@@ -1238,7 +1250,7 @@ void rxStallGuard() {
   statRxStalls++;
 
   Serial.println("ODBIOR: brak ramek > 2 min - pelna reinicjalizacja toru RX");
-  logEventS(LOG_ERROR, "«Brak ramek przez 2 min - restart toru odbioru|No frames for 2 min - restarting receiver»");
+  logEventS(LOG_ERROR, "«Brak ramek przez 2 min - reset toru odbioru|No frames for 2 min - receiver reset»");
   statRxRestarts++;
 
   ccInitBase();
