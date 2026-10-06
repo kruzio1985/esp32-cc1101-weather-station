@@ -212,8 +212,16 @@ uint32_t afcUpdates  = 0;        // ile razy dostrajano
 unsigned long afcLastFrameMs = 0;
 unsigned long afcLastSaveMs  = 0;
 
-const float AFC_DAMPING     = 0.7f;       // jaka czesc odchylenia korygowac na jedna ramke
-const float AFC_STEP_MAX_HZ = 15000.0f;   // maksymalny krok na jedna ramke
+const float AFC_DAMPING     = 0.5f;       // jaka czesc odchylenia korygowac na jedna ramke
+const float AFC_STEP_MAX_HZ = 8000.0f;    // maksymalny krok na jedna ramke
+// FREQEST jest SZUMNY na marginalnych ramkach - zmierzono skoki +46 kHz, -43 kHz,
+// +135 kHz miedzy kolejnymi ramkami. Dlatego nie ufamy pojedynczemu odczytowi:
+// bierzemy MEDIANE z 5 ostatnich pomiarow. Inaczej automat szarpie odbiornikiem
+// (srodek skakal 868.354 / 868.380 / 868.394) i gubi sygnal, ktory wlasnie znalazl.
+const int   AFC_HIST_N      = 5;
+int   afcHist[AFC_HIST_N]   = {0, 0, 0, 0, 0};
+int   afcHistN              = 0;          // ile probek zebrano
+int   afcHistIdx            = 0;
 const float AFC_MIN_MHZ     = 867.50f;    // granice bezpieczenstwa
 const float AFC_MAX_MHZ     = 869.00f;
 const unsigned long AFC_REVERT_MS = 300000UL;  // 5 min bez ramki -> wroc do ostatniej dobrej
@@ -2321,6 +2329,8 @@ void afcSave() {
 // zeby odbiornik jechal za czujnikiem (dryf termiczny ~17 kHz/st. C).
 void afcOnFrame() {
   // Gdy ramka przyjdzie, AFC przejmuje precyzyjne dostrajanie - konczymy szukanie.
+  // UWAGA: NIE zerujemy tu historii pomiarow. Reset na poczatku kazdej ramki sprawial,
+  // ze mediana nigdy nie zebrala 3 probek i automat w ogole nie korygowal (updates=0).
   afcHuntStep = 0;
   unsigned long now = millis();
   afcLastFrameMs  = now;
@@ -2334,6 +2344,18 @@ void afcOnFrame() {
   if (freqOverride) return;                    // reczne ustawienie ma priorytet
   if (est == (int8_t)-128) return;             // wartosc nieprawidlowa
   if (offHz > 250000.0f || offHz < -250000.0f) return;   // poza zakresem sensu
+
+  // Mediana z ostatnich AFC_HIST_N pomiarow - pojedynczy szum nie szarpnie odbiornikiem.
+  afcHist[afcHistIdx] = (int)offHz;
+  afcHistIdx = (afcHistIdx + 1) % AFC_HIST_N;
+  if (afcHistN < AFC_HIST_N) afcHistN++;
+  if (afcHistN < 3) return;                    // za malo probek na wiarygodna mediane
+  int tmp[AFC_HIST_N];
+  for (int i = 0; i < AFC_HIST_N; i++) tmp[i] = afcHist[i];
+  for (int i = 0; i < AFC_HIST_N - 1; i++)
+    for (int j = 0; j < AFC_HIST_N - 1 - i; j++)
+      if (tmp[j] > tmp[j + 1]) { int t = tmp[j]; tmp[j] = tmp[j + 1]; tmp[j + 1] = t; }
+  offHz = (float)tmp[AFC_HIST_N / 2];
 
   float step = offHz * AFC_DAMPING / 1e6f;     // tlumienie: nie skaczemy na raz o calosc
   const float lim = AFC_STEP_MAX_HZ / 1e6f;
