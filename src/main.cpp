@@ -197,6 +197,38 @@ static const uint8_t FREQ_TABLE[][3] = {
 };
 const int NUM_FREQS = sizeof(FREQ_TABLE) / sizeof(FREQ_TABLE[0]);
 
+// ==================== AFC: AUTOMATYCZNE DOSTRAJANIE CZESTOTLIWOSCI ====================
+// PO CO: czujnik VEVOR dryfuje z temperatura ~17 kHz na 1 st. C. Zmierzone 2026-10-06:
+// przy 13 st. C nadawal na ~868.42 MHz, gdy odbiornik sluchal na 868.30 MHz - roznica
+// wypadala poza filtr i ramki znikaly (1 na ~100 s). Przy -20 st. C odjedzie grubo poza
+// KAZDY staly filtr, dlatego srodek pasma musi jechac za czujnikiem sam.
+// JAK: CC1101 udostepnia FREQEST (0x32) - estymate odchylenia czestotliwosci z demodulatora.
+// 1 LSB = f_xosc/2^14 = 26 MHz/16384 = 1586.9 Hz, zakres +-127 LSB = +-201 kHz.
+// Po kazdej poprawnej ramce przesuwamy srodek pasma o to odchylenie (z tlumieniem).
+float afcFreqMhz     = 868.42f;  // aktualny srodek pasma odbioru
+float afcLastGoodMhz = 0.0f;     // ostatnia czestotliwosc, przy ktorej przyszla ramka
+int   afcOffsetHz    = 0;        // ostatnio zmierzone odchylenie
+uint32_t afcUpdates  = 0;        // ile razy dostrajano
+unsigned long afcLastFrameMs = 0;
+unsigned long afcLastSaveMs  = 0;
+
+const float AFC_DAMPING     = 0.7f;       // jaka czesc odchylenia korygowac na jedna ramke
+const float AFC_STEP_MAX_HZ = 15000.0f;   // maksymalny krok na jedna ramke
+const float AFC_MIN_MHZ     = 867.50f;    // granice bezpieczenstwa
+const float AFC_MAX_MHZ     = 869.00f;
+const unsigned long AFC_REVERT_MS = 300000UL;  // 5 min bez ramki -> wroc do ostatniej dobrej
+// Przeszukiwanie, gdy AFC nie ma z czego wystartowac (brak ramki = brak FREQEST).
+// Skok +-20 kHz wokol ostatniej dobrej czestotliwosci, w obie strony, do +-120 kHz.
+// Dzienny dryf obsluguje AFC na biezaco; to jest siatka bezpieczenstwa na duzy skok
+// temperatury (zimą dryf potrafi wyniesc kilkaset kHz - wiecej niz szerokosc filtra).
+const float AFC_HUNT_STEP_KHZ = 20.0f;
+const int   AFC_HUNT_MAX_K    = 6;      // 6 * 20 kHz = 120 kHz w kazda strone
+int   afcHuntStep    = 0;               // 0 = nie szukamy
+float afcBaseMhz     = 868.42f;         // punkt odniesienia przeszukiwania
+
+void afcOnFrame();   // wywolywane po kazdej poprawnej ramce (definicja nizej)
+void afcSave();      // zapis do NVS (definicja nizej - potrzebne Preferences)
+
 // ==================== PROFILE MODEMU ====================
 // Kolumny: MDMCFG4, MDMCFG3, MDMCFG2 (MOD_FORMAT, SYNC_MODE=0), DEVIATN
 static const char* PROF_NAMES[] = {
@@ -723,6 +755,15 @@ void ccWriteFreq(uint8_t d, uint8_t e, uint8_t f) {
   ccWrite(0x0F, f);  // FREQ0
 }
 
+// Ustawia czestotliwosc z wartosci w MHz (FREQ word = round(f_hz * 2^16 / 26 MHz)).
+// UWAGA: podlega temu samemu recznemu nadpisaniu co ccWriteFreq - jesli uzytkownik
+// ustawil czestotliwosc na sztywno (freqOverride), AFC jej nie ruszy.
+void ccWriteFreqMhz(float mhz) {
+  if (mhz < AFC_MIN_MHZ || mhz > AFC_MAX_MHZ) return;
+  uint32_t w = (uint32_t)((double)mhz * 1e6 * 65536.0 / 26e6 + 0.5);
+  ccWriteFreq((w >> 16) & 0xFF, (w >> 8) & 0xFF, w & 0xFF);
+}
+
 uint8_t ccRead(uint8_t reg) {
   uint8_t tx[2] = { (uint8_t)(reg | 0x80), 0x00 };
   uint8_t rx[2];
@@ -1006,21 +1047,16 @@ void applyVevorMode() {
   ccStrobe(0x36);  // SIDLE
   ccStrobe(CC_SFRX);  // SFRX
 
-  // CZESTOTLIWOSC: 868.37 MHz, nie 868.30!
-  // POMIAR 2026-10-06 (/sniff + analiza bitowa): czujnik nadaje na ~868.40-868.44 MHz,
-  // a odbiornik sluchal na 868.30 MHz. Roznica ~100 kHz wypadala POZA filtr 162.5 kHz
-  // (+-81 kHz), wiec odbierany byl tylko skraj filtra: RSSI spadlo z -58 do -74 dBm,
-  // dyskriminator FSK dawal stronniczy strumien (61.8% jedynek), a sync CA54 nie
-  // trafial - ramki znikaly (1 na ~100 s zamiast co 20 s), mimo ze radio bylo zdrowe.
-  // Dodatkowo dryf zalezy od temperatury (~13 ppm/^C), co dawalo wzorzec dzien/noc:
-  // 06.10 10:48-18:42 (cieplo) 8 godzin bez zaniku, noce - sypalo sie.
-  // Dlatego srodek pasma przesuniety na 868.37, a szerokosc ZWIEKSZONA do 271 kHz,
-  // zeby w pasmie zmiescilo sie i 868.30 (stan cieply), i 868.44 (stan zimny).
-  ccWriteFreq(0x21, 0x66, 0x1A);  // 868.37 MHz
+  // Srodek pasma bierze sie z AFC (afcFreqMhz) - patrz opis przy afcFreqMhz.
+  // 868.42 MHz to wartosc startowa zmierzona 2026-10-06; dalej odbiornik dostraja sie sam.
+  ccWriteFreqMhz(afcFreqMhz);
 
-  // MDMCFG4 = 0x68: CHANBW_E=1, CHANBW_M=2 -> BW 271 kHz (bylo 0x98 -> 162.5 kHz),
-  // DRATE_E=8 bez zmian (przepustowosc pozostaje ~11.11 kbaud z MDMCFG3=0xC0).
-  ccWrite(0x10, 0x68);  // MDMCFG4: rate ~11.11k, BW 271 kHz (poszerzone pod dryf)
+  // MDMCFG4 = 0x68: CHANBW_E=1, CHANBW_M=2 -> BW 271 kHz, DRATE_E=8 (~11.11 kbaud).
+  // POMIAR 2026-10-06 (23:00-23:30): przy tym filtrze ramki przychodzily co ~32 s,
+  // przy 162.5 kHz ZERO, przy 541 kHz ZERO. Czyli 271 kHz jest optimum: na tyle szeroko,
+  // ze toleruje odstrojenie czujnika, i na tyle wąsko, ze demodulator jeszcze go widzi.
+  // Szerszy filtr = wiecej szumu i slabszy sygnal na wejsciu dyskryminatora.
+  ccWrite(0x10, 0x68);  // MDMCFG4: 2-FSK, rate ~11.11k, BW 271 kHz (tolerancja odstrojenia)
   ccWrite(0x11, 0xC0);  // MDMCFG3: DRATE_M=192 -> ~11.11 kbaud
   // UWAGA (sprawdzone na sprzęcie 2026-09-27): próbowano tu SPRZĘTOWEGO sync
   // word (SYNC1=0xCA, SYNC0=0x54, MDMCFG2=0x02, stała długość 28 B), żeby
@@ -1253,6 +1289,31 @@ void rxStallGuard() {
   logEventS(LOG_ERROR, "«Brak ramek przez 2 min - reset toru odbioru|No frames for 2 min - receiver reset»");
   statRxRestarts++;
 
+  // AFC: brak ramek. Najpierw wroc do ostatniej dobrej czestotliwosci, a jesli to nie
+  // pomaga, przeszukuj pasmo skokami - czujnik mogl odjechac z temperatura dalej,
+  // niz siega staly filtr. Pierwsza odebrana ramka konczy szukanie (patrz afcOnFrame).
+  if (!freqOverride) {
+    float base = (afcLastGoodMhz > 0.0f) ? afcLastGoodMhz : afcBaseMhz;
+    float d = afcFreqMhz - base;
+    if (d < 0.005f && d > -0.005f) {
+      // jestesmy na ostatniej dobrej - zacznijmy przeszukiwanie
+      afcHuntStep++;
+      int k = (afcHuntStep + 1) / 2;
+      float off = (afcHuntStep % 2) ? (float)k : -(float)k;
+      if (k > AFC_HUNT_MAX_K) { afcHuntStep = 0; off = 0.0f; }
+      afcFreqMhz = base + off * (AFC_HUNT_STEP_KHZ / 1000.0f);
+      if (afcFreqMhz < AFC_MIN_MHZ) afcFreqMhz = AFC_MIN_MHZ;
+      if (afcFreqMhz > AFC_MAX_MHZ) afcFreqMhz = AFC_MAX_MHZ;
+      logEventS(LOG_WARN, "«AFC: szukam czujnika|AFC: hunting for sensor» " + String(afcFreqMhz, 3) + " MHz");
+    } else {
+      // wroc do ostatniej dobrej (zabezpieczenie przed rozjechaniem sie AFC)
+      afcFreqMhz = base;
+      logEventS(LOG_WARN, "«AFC: powrot do ostatniej dobrej czestotliwosci|AFC: revert to last good frequency» " + String(afcFreqMhz, 4) + " MHz");
+    }
+    ccWriteFreqMhz(afcFreqMhz);
+    afcSave();
+  }
+
   ccInitBase();
   ccWrite(0x00, 0x06);   // IOCFG2: GDO2 = wskaznik sync word
   if (rxMode == MODE_FINE_OFFSET) applyFineOffsetMode();
@@ -1278,6 +1339,7 @@ bool handleVevorFrame(uint8_t* frame, int rssi) {
   lastDecodedHex = bytesToHex(frame, 28);
   acceptedFrames++;
   lastFrameMs = millis();
+  afcOnFrame();   // automatyczne dostrojenie srodka pasma do czujnika
   diagPush(frame, 28, rssi, true);
   publishWeather();
 
@@ -2235,6 +2297,10 @@ void loadRxMode() {
   }
   rxMode = (RxMode)modePrefs.getInt("rxMode", MODE_VEVOR_7IN1);
   if (rxMode != MODE_RAW_SCAN && rxMode != MODE_FINE_OFFSET && rxMode != MODE_VEVOR_7IN1 && rxMode != MODE_BRESSER && rxMode != MODE_VEVOR_YT60309 && rxMode != MODE_WEATHER_AUTO) rxMode = MODE_RAW_SCAN;
+  // Srodek pasma odbioru zapamietany przez AFC (dryf termiczny czujnika).
+  afcFreqMhz = modePrefs.getFloat("afcFreq", 868.42f);
+  if (afcFreqMhz < AFC_MIN_MHZ || afcFreqMhz > AFC_MAX_MHZ) afcFreqMhz = 868.42f;
+  afcBaseMhz = afcFreqMhz;   // punkt odniesienia dla przeszukiwania
   modePrefs.end();
 }
 
@@ -2242,6 +2308,50 @@ void saveRxMode() {
   modePrefs.begin("mode", false);
   modePrefs.putInt("rxMode", (int)rxMode);
   modePrefs.end();
+}
+
+// ---------- AFC: dostrajanie srodka pasma do czujnika ----------
+void afcSave() {
+  modePrefs.begin("mode", false);
+  modePrefs.putFloat("afcFreq", afcFreqMhz);
+  modePrefs.end();
+}
+
+// Wywolywane po KAZDEJ poprawnej ramce: czyta FREQEST i przesuwa srodek pasma tak,
+// zeby odbiornik jechal za czujnikiem (dryf termiczny ~17 kHz/st. C).
+void afcOnFrame() {
+  // Gdy ramka przyjdzie, AFC przejmuje precyzyjne dostrajanie - konczymy szukanie.
+  afcHuntStep = 0;
+  unsigned long now = millis();
+  afcLastFrameMs  = now;
+  afcLastGoodMhz  = afcFreqMhz;   // ta czestotliwosc wlasnie dala ramke
+  afcBaseMhz      = afcFreqMhz;
+
+  int8_t est = (int8_t)ccStatusRead(0x32);               // FREQEST (znakowany)
+  float offHz = (float)est * (26000000.0f / 16384.0f);   // 1 LSB = 1586.9 Hz
+  afcOffsetHz = (int)offHz;
+
+  if (freqOverride) return;                    // reczne ustawienie ma priorytet
+  if (est == (int8_t)-128) return;             // wartosc nieprawidlowa
+  if (offHz > 250000.0f || offHz < -250000.0f) return;   // poza zakresem sensu
+
+  float step = offHz * AFC_DAMPING / 1e6f;     // tlumienie: nie skaczemy na raz o calosc
+  const float lim = AFC_STEP_MAX_HZ / 1e6f;
+  if (step >  lim) step =  lim;
+  if (step < -lim) step = -lim;
+  if (step < 0.0002f && step > -0.0002f) return;   // < 200 Hz - nie warto ruszac
+
+  float nf = afcFreqMhz + step;
+  if (nf < AFC_MIN_MHZ || nf > AFC_MAX_MHZ) return;
+
+  afcFreqMhz = nf;
+  afcUpdates++;
+  ccWriteFreqMhz(afcFreqMhz);
+
+  if (now - afcLastSaveMs > 60000UL) {         // NVS nie czesciej niz raz na minute
+    afcLastSaveMs = now;
+    afcSave();
+  }
 }
 
 static int hexVal(char c) {
@@ -4700,6 +4810,41 @@ void handleHealth() {
 
 // /status - stan w JSON (do skryptów / HA)
 
+// /afc - podglad i reczne ustawienie srodka pasma odbioru (automatyczne dostrajanie).
+//   /afc              -> JSON ze stanem (czestotliwosc, odchylenie, liczba korekt)
+//   /afc?mhz=868.42   -> reczne ustawienie i WYLACZENIE automatu
+//   /afc?auto=1       -> z powrotem automatyczne dostrajanie
+void handleAfc() {
+  if (server.hasArg("mhz")) {
+    float f = server.arg("mhz").toFloat();
+    if (f < AFC_MIN_MHZ || f > AFC_MAX_MHZ) {
+      server.send(400, "text/plain; charset=utf-8", "Zakres 867.500 .. 869.000 MHz\n");
+      return;
+    }
+    afcFreqMhz = f;
+    ccWriteFreqMhz(afcFreqMhz);
+    afcLastGoodMhz = f;      // automat dostraja dalej od tego miejsca
+    afcSave();
+    logEventS(LOG_WARN, "«Reczne ustawienie czestotliwosci odbioru|Manual RX frequency set»: " + String(f, 3) + " MHz");
+    server.send(200, "text/plain; charset=utf-8", "Ustawiono " + String(f, 3) + " MHz (automat dostraja dalej od tego miejsca)\n");
+    return;
+  }
+  if (server.hasArg("auto") && server.arg("auto") == "1") {
+    applyVevorMode();
+    afcLastGoodMhz = 0.0f;
+    afcOffsetHz = 0;
+    logEventS(LOG_INFO, "«AFC: automatyczne dostrajanie zresetowane|AFC: auto tuning reset»");
+    server.send(200, "text/plain; charset=utf-8", "AFC zresetowane - dostraja sie od nowa\n");
+    return;
+  }
+  String j = "{\"freqMhz\":" + String(afcFreqMhz, 4) +
+             ",\"offsetHz\":" + String(afcOffsetHz) +
+             ",\"updates\":" + String(afcUpdates) +
+             ",\"lastGoodMhz\":" + String(afcLastGoodMhz, 4) +
+             ",\"zakres\":\"867.500-869.000\"}";
+  server.send(200, "application/json", j);
+}
+
 void handleStatus() {
   String j = "{";
   j += "\"uptime\":" + String((millis() - startTime) / 1000) + ",";
@@ -4712,6 +4857,10 @@ void handleStatus() {
   j += "\"watchdogEnabled\":" + String(wdtEnabled ? "true" : "false") + ",";
   j += "\"wdtTimeoutS\":" + String(WDT_TIMEOUT_S) + ",";
   j += "\"wifiSleep\":" + String(gWifiSleepOn ? "true" : "false") + ",";
+  j += "\"afcFreqMhz\":" + String(afcFreqMhz, 4) + ",";
+  j += "\"afcOffsetHz\":" + String(afcOffsetHz) + ",";
+  j += "\"afcUpdates\":" + String(afcUpdates) + ",";
+  j += "\"afcAuto\":" + String(freqOverride ? "false" : "true") + ",";
   j += "\"radioVersion\":" + String(ccStatusRead(0x31)) + ",";
   j += "\"radioOk\":" + String(ccStatusRead(0x31) == 0x14 ? "true" : "false") + ",";
   j += "\"marcState\":" + String(ccStatusRead(0x35) & 0x1F) + ",";
@@ -5036,6 +5185,7 @@ void setup() {
   server.on("/update", HTTP_POST, handleOtaUpdate, handleOtaUpload);
   server.on("/log", handleLog);
   server.on("/status", handleStatus);
+  server.on("/afc", handleAfc);
   server.on("/reboot", handleReboot);
   server.on("/errors", handleErrorsPage);
   server.on("/errtest", handleErrTest);
