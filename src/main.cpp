@@ -237,6 +237,25 @@ float afcBaseMhz     = 868.42f;         // punkt odniesienia przeszukiwania
 void afcOnFrame();   // wywolywane po kazdej poprawnej ramce (definicja nizej)
 void afcSave();      // zapis do NVS (definicja nizej - potrzebne Preferences)
 
+// ==================== FILTR CZUJNIKA (numer seryjny) ====================
+// Protokol VEVOR nie ma sumy kontrolnej. Zmierzone 2026-10-06 w logu: w zasiegu
+// nadaja DWA czujniki NA PRZEMIAN (co ~20 s kazdy):
+//     d86b2565d196  - NASZ (te same dane co 04.10, opad 0.00 mm)
+//     b0d64acba32d  - OBCY (dawal opad 61.28 mm przy zerowym deszczu, a stacja
+//                     wyliczala z tego 11033.7 mm/h)
+// Osobno trafiaja sie uszkodzone ramki z losowym ogonem (efff73afaaba, 79dffefc9eff).
+// Dlatego przyjmujemy TYLKO nasz numer seryjny.
+// BEZPIECZNIK: gdybysmy odrzucali wszystko (np. po wymianie czujnika), po 60
+// odrzuceniach w ciagu 5 minut filtr wylacza sie sam - odbioru nie da sie zabic.
+const uint8_t VEV_ID[6] = { 0xd8, 0x6b, 0x25, 0x65, 0xd1, 0x96 };
+bool     vevIdFilter    = true;   // czy filtrujemy po numerze seryjnym
+uint16_t rejOtherSensor = 0;      // ile ramek odrzucono jako obcy czujnik
+uint16_t rejImplausible = 0;      // ile ramek odrzucono za nierealne dane
+uint16_t tailChanges    = 0;      // ile razy zmienil sie numer seryjny
+uint32_t rejFirstMs     = 0;
+uint8_t  lastTail[6]    = {0, 0, 0, 0, 0, 0};
+bool     lastTailSet    = false;
+
 // ==================== PROFILE MODEMU ====================
 // Kolumny: MDMCFG4, MDMCFG3, MDMCFG2 (MOD_FORMAT, SYNC_MODE=0), DEVIATN
 static const char* PROF_NAMES[] = {
@@ -1335,8 +1354,52 @@ void rxStallGuard() {
 // log na port szeregowy i wysylka dalej. Zwraca true, gdy ramka byla poprawna.
 // Wywolywana z dwoch sciezek (bezposredniej i awaryjnej), zeby uniknac duplikacji.
 bool handleVevorFrame(uint8_t* frame, int rssi) {
+  // --- Filtr czujnika: ostatnie 6 bajtow ramki to numer seryjny. Przyjmujemy
+  // tylko nasz (patrz VEV_ID). Obcy czujnik w okolicy podawal bzdury.
+  uint8_t* tail6 = frame + 22;
+  if (!lastTailSet || memcmp(tail6, lastTail, 6) != 0) {
+    for (int i = 0; i < 6; i++) lastTail[i] = tail6[i];
+    if (lastTailSet) tailChanges++;
+    lastTailSet = true;
+  }
+  if (vevIdFilter && memcmp(tail6, VEV_ID, 6) != 0) {
+    rejectedFrames++;
+    rejOtherSensor++;
+    diagPush(frame, 28, rssi, false);
+    if (rejOtherSensor == 1) rejFirstMs = millis();
+    if (rejOtherSensor <= 3 || (rejOtherSensor % 50) == 0)
+      logEventS(LOG_WARN, "«Ramka innego czujnika - odrzucona|Frame from another sensor - rejected»: " + bytesToHex(tail6, 6));
+    // Bezpiecznik: gdyby filtr odrzucal wszystko (np. po wymianie czujnika),
+    // wylacza sie sam - lepiej przyjmowac wszystko niz nie odbierac nic.
+    if (rejOtherSensor >= 60 && (millis() - rejFirstMs) < 300000UL) {
+      vevIdFilter = false;
+      logEventS(LOG_WARN, "«Filtr czujnika WYLACZONY - przyjmuje wszystkie ramki|Sensor filter DISABLED - accepting all frames»");
+    }
+    return false;
+  }
+  if (vevIdFilter) rejOtherSensor = 0;
+
   WeatherData w;
   if (!decodeVevor7in1(frame, 28, w)) return false;
+
+  // --- Kontrola sensownosci. Odrzucamy TYLKO to, co fizycznie niemozliwe,
+  // zeby nie zgubic prawdziwych danych (np. prawdziwego deszczu).
+  bool implausible = false;
+  if (w.haveRain && lastWeatherValid) {
+    float dRain = w.rainMm - lastWeather.rainMm;   // licznik opadu rosnie
+    if (dRain > 20.0f || dRain < -5.0f) implausible = true;  // 20 mm w 20 s = 3600 mm/h
+  }
+  if (w.haveWind && (w.windAvgMs < 0.0f || w.windAvgMs > 60.0f)) implausible = true;
+  if (w.haveGust && (w.windMaxMs < 0.0f || w.windMaxMs > 80.0f)) implausible = true;
+  if (w.haveHum  && ((float)w.humidity < 0.0f || (float)w.humidity > 100.0f)) implausible = true;
+  if (implausible) {
+    rejectedFrames++;
+    rejImplausible++;
+    diagPush(frame, 28, rssi, false);
+    logEventS(LOG_WARN, "«Ramka odrzucona - nierealne dane|Frame rejected - implausible data»: " + bytesToHex(frame, 28));
+    Serial.println("VEVOR: ramka odrzucona (nierealne dane)");
+    return false;
+  }
 
   totalFrames++;
   w.rssi = rssi;
@@ -4883,6 +4946,10 @@ void handleStatus() {
   j += "\"afcOffsetHz\":" + String(afcOffsetHz) + ",";
   j += "\"afcUpdates\":" + String(afcUpdates) + ",";
   j += "\"afcAuto\":" + String(freqOverride ? "false" : "true") + ",";
+  j += "\"rejImplausible\":" + String(rejImplausible) + ",";
+  j += "\"rejOtherSensor\":" + String(rejOtherSensor) + ",";
+  j += "\"vevIdFilter\":" + String(vevIdFilter ? "true" : "false") + ",";
+  j += "\"tailChanges\":" + String(tailChanges) + ",";
   j += "\"radioVersion\":" + String(ccStatusRead(0x31)) + ",";
   j += "\"radioOk\":" + String(ccStatusRead(0x31) == 0x14 ? "true" : "false") + ",";
   j += "\"marcState\":" + String(ccStatusRead(0x35) & 0x1F) + ",";
