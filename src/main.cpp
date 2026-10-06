@@ -245,11 +245,16 @@ void afcSave();      // zapis do NVS (definicja nizej - potrzebne Preferences)
 //                     wyliczala z tego 11033.7 mm/h)
 // Osobno trafiaja sie uszkodzone ramki z losowym ogonem (efff73afaaba, 79dffefc9eff).
 // Dlatego przyjmujemy TYLKO nasz numer seryjny.
-// BEZPIECZNIK: gdybysmy odrzucali wszystko (np. po wymianie czujnika), po 60
-// odrzuceniach w ciagu 5 minut filtr wylacza sie sam - odbioru nie da sie zabic.
+// BEZPIECZNIK (2026-10-07): kryterium to BRAK PRZYJETYCH ramek przez 5 minut,
+// a NIE liczba odrzuconych. W budynku pracuje wiele urzadzen 868 MHz, wiec setki
+// odrzucen na godzine to norma - licznik odrzucen wylaczalby filtr bez powodu.
 const uint8_t VEV_ID[6] = { 0xd8, 0x6b, 0x25, 0x65, 0xd1, 0x96 };
 bool     vevIdFilter    = true;   // czy filtrujemy po numerze seryjnym
-uint16_t rejOtherSensor = 0;      // ile ramek odrzucono jako obce/obcy czujnik
+// UWAGA na semantyke: rejOtherSensor ZERUJE SIE przy kazdej przyjetej ramce
+// (liczy odrzucenia od ostatniej naszej), dlatego w /status prawie zawsze
+// pokazuje 0. Suma od startu to obceLacznie.
+uint16_t rejOtherSensor = 0;      // odrzucenia obcych ramek od ostatniej naszej
+uint32_t obceLacznie    = 0;      // WSZYSTKIE obce ramki od startu (nie zeruje sie)
 uint16_t rejImplausible = 0;      // ile ramek odrzucono za nierealne dane
 uint16_t tailChanges    = 0;      // ile razy zmienil sie numer seryjny
 unsigned long lastAcceptMs = 0;   // kiedy ostatnio PRZYJELISMY nasza ramke
@@ -485,6 +490,7 @@ uint32_t statMaxLoopMs   = 0;    // najdłuższe wykonanie loop() w tej sesji
 uint32_t statLoopCount   = 0;
 uint32_t statRadioReinit = 0;    // ile razy reinicjalizowano radio
 uint32_t statRxRestarts  = 0;    // ile razy restartowano odbiór (SRX)
+uint32_t statFifoOverflow = 0;   // ile razy przelał się bufor FIFO odbiornika
 uint32_t statWifiRecon   = 0;    // ile razy łączyło się ponownie z WiFi
 uint32_t statSpiFallback = 0;    // ile razy obniżono prędkość SPI
 uint32_t statHeapMin     = 0xFFFFFFFF;
@@ -1371,6 +1377,7 @@ bool handleVevorFrame(uint8_t* frame, int rssi) {
     if (!ours) {
       rejectedFrames++;
       rejOtherSensor++;
+      obceLacznie++;
       diagPush(frame, 28, rssi, false);
       if (rejOtherSensor <= 3 || (rejOtherSensor % 200) == 0)
         logEventS(LOG_WARN, "«Ramka obca - odrzucona|Foreign frame - rejected»: " + bytesToHex(frame, 28));
@@ -1457,10 +1464,19 @@ void loopVevor() {
     // FIFO sie przelało (szum przy braku sync). Wyczysc i wroc do RX -
     // ale nie częściej niż raz na sekundę (SRX strobowany za czesto
     // trwale blokuje CC1101).
+    // Kazde przelanie to POTENCJALNA utrata ramki (bufor kola jest czyszczony),
+    // dlatego liczymy je i raportujemy w /status jako fifoOverflow.
+    statFifoOverflow++;
     static unsigned long lastFlush = 0;
     if (millis() - lastFlush >= 1000) {
       lastFlush = millis();
       ccStartRx();
+    }
+    // Log najwyzej raz na 10 s - przy tloku w eterze przelania moga byc czeste.
+    static unsigned long lastOvLog = 0;
+    if (millis() - lastOvLog >= 10000) {
+      lastOvLog = millis();
+      logEventS(LOG_WARN, "«FIFO odbiornika przelane|Receiver FIFO overflow» - «bufor czyszczony|buffer cleared» (" + String(statFifoOverflow) + "x)");
     }
     rcount = 0;
     delay(1);
@@ -2729,7 +2745,7 @@ void handleRoot() {
   html += (rxMode == MODE_FINE_OFFSET)
             ? "868.30 / FSK_17k"
             : (rxMode == MODE_VEVOR_7IN1)
-              ? "868.30 / FSK_11k"
+              ? String(afcFreqMhz, 4) + " / FSK_11k"
               : (rxMode == MODE_VEVOR_YT60309)
                 ? "868.35 / FSK_11k"
                 : (rxMode == MODE_WEATHER_AUTO)
@@ -3196,8 +3212,12 @@ refreshSys();
 void handleJson() {
   radioHealthCheck();
   String json = "{\"freq\":\"";
-  json += (rxMode == MODE_FINE_OFFSET) ? "868.30" : (rxMode == MODE_VEVOR_7IN1) ? "868.30" : (rxMode == MODE_VEVOR_YT60309) ? "868.35" : (rxMode == MODE_BRESSER) ? "868.30" : String(FREQ_NAMES[currentFreq]);
-  json += "\",\"prof\":\"";
+  // "freq" = czestotliwosc RZECZYWISCIE wpisana do CC1101. W trybie VEVOR stroi
+  // nia AFC (afcFreqMhz); wczesniej /json podawal nominalne "868.30" mimo
+  // odbioru na 868.3490, co mylilo diagnostyke.
+  json += (rxMode == MODE_FINE_OFFSET) ? "868.30" : (rxMode == MODE_VEVOR_7IN1) ? String(afcFreqMhz, 4) : (rxMode == MODE_VEVOR_YT60309) ? "868.35" : (rxMode == MODE_BRESSER) ? "868.30" : String(FREQ_NAMES[currentFreq]);
+  json += "\",\"freqMhz\":" + String(afcFreqMhz, 4) + ",\"afcOffsetHz\":" + String(afcOffsetHz);
+  json += ",\"prof\":\"";
   json += (rxMode == MODE_FINE_OFFSET) ? "FSK_17k" : (rxMode == MODE_VEVOR_7IN1 || rxMode == MODE_VEVOR_YT60309) ? "FSK_11k" : (rxMode == MODE_BRESSER) ? "FSK_8k" : String(PROF_NAMES[currentProf]);
   json += "\",\"mode\":\"" + String(rxMode == MODE_FINE_OFFSET ? "fine_offset" : (rxMode == MODE_VEVOR_7IN1 ? "vevor" : (rxMode == MODE_VEVOR_YT60309 ? "vevor_yt60309" : (rxMode == MODE_WEATHER_AUTO ? "auto" : (rxMode == MODE_BRESSER ? "bresser" : "raw_scan"))))) + "\",";
   json += "\"totalFrames\":" + String(totalFrames) + ",";
@@ -3205,6 +3225,9 @@ void handleJson() {
   json += "\"rejectedFrames\":" + String(rejectedFrames) + ",";
   json += "\"filterEnabled\":" + String(filterCfg.enabled ? "true" : "false") + ",";
   json += "\"filterPattern\":\"" + filterCfg.pattern + "\",";
+  // Filtr po numerze seryjnym VEVOR - ODRĘBNY od "filterPattern" powyżej.
+  json += "\"vevIdFilter\":" + String(vevIdFilter ? "true" : "false") + ",";
+  json += "\"obceLacznie\":" + String(obceLacznie) + ",";
   json += "\"uptime\":" + String((millis() - startTime) / 1000) + ",";
 
   // Zdekodowane dane pogodowe (po kalibracji — takie jak na stronie WWW)
@@ -4958,6 +4981,8 @@ void handleStatus() {
   j += "\"afcAuto\":" + String(freqOverride ? "false" : "true") + ",";
   j += "\"rejImplausible\":" + String(rejImplausible) + ",";
   j += "\"rejOtherSensor\":" + String(rejOtherSensor) + ",";
+  j += "\"obceLacznie\":" + String(obceLacznie) + ",";
+  j += "\"fifoOverflow\":" + String(statFifoOverflow) + ",";
   j += "\"vevIdFilter\":" + String(vevIdFilter ? "true" : "false") + ",";
   j += "\"tailChanges\":" + String(tailChanges) + ",";
   j += "\"radioVersion\":" + String(ccStatusRead(0x31)) + ",";
