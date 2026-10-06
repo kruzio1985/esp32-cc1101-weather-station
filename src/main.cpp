@@ -249,10 +249,10 @@ void afcSave();      // zapis do NVS (definicja nizej - potrzebne Preferences)
 // odrzuceniach w ciagu 5 minut filtr wylacza sie sam - odbioru nie da sie zabic.
 const uint8_t VEV_ID[6] = { 0xd8, 0x6b, 0x25, 0x65, 0xd1, 0x96 };
 bool     vevIdFilter    = true;   // czy filtrujemy po numerze seryjnym
-uint16_t rejOtherSensor = 0;      // ile ramek odrzucono jako obcy czujnik
+uint16_t rejOtherSensor = 0;      // ile ramek odrzucono jako obce/obcy czujnik
 uint16_t rejImplausible = 0;      // ile ramek odrzucono za nierealne dane
 uint16_t tailChanges    = 0;      // ile razy zmienil sie numer seryjny
-uint32_t rejFirstMs     = 0;
+unsigned long lastAcceptMs = 0;   // kiedy ostatnio PRZYJELISMY nasza ramke
 uint8_t  lastTail[6]    = {0, 0, 0, 0, 0, 0};
 bool     lastTailSet    = false;
 
@@ -1362,22 +1362,31 @@ bool handleVevorFrame(uint8_t* frame, int rssi) {
     if (lastTailSet) tailChanges++;
     lastTailSet = true;
   }
-  if (vevIdFilter && memcmp(tail6, VEV_ID, 6) != 0) {
-    rejectedFrames++;
-    rejOtherSensor++;
-    diagPush(frame, 28, rssi, false);
-    if (rejOtherSensor == 1) rejFirstMs = millis();
-    if (rejOtherSensor <= 3 || (rejOtherSensor % 50) == 0)
-      logEventS(LOG_WARN, "«Ramka innego czujnika - odrzucona|Frame from another sensor - rejected»: " + bytesToHex(tail6, 6));
-    // Bezpiecznik: gdyby filtr odrzucal wszystko (np. po wymianie czujnika),
-    // wylacza sie sam - lepiej przyjmowac wszystko niz nie odbierac nic.
-    if (rejOtherSensor >= 60 && (millis() - rejFirstMs) < 300000UL) {
-      vevIdFilter = false;
-      logEventS(LOG_WARN, "«Filtr czujnika WYLACZONY - przyjmuje wszystkie ramki|Sensor filter DISABLED - accepting all frames»");
+  if (vevIdFilter) {
+    // Nasza ramka = numer seryjny ORAZ stala czesc naglowka (bajty 4-5 = 10 02
+    // w kazdej zaobserwowanej ramce naszego czujnika). W budynku pracuja inne
+    // urzadzenia 868 MHz i NIE DA SIE ich usunac - dlatego odsiewamy je tutaj,
+    // w oprogramowaniu, po tresci ramki.
+    bool ours = (memcmp(tail6, VEV_ID, 6) == 0) && frame[4] == 0x10 && frame[5] == 0x02;
+    if (!ours) {
+      rejectedFrames++;
+      rejOtherSensor++;
+      diagPush(frame, 28, rssi, false);
+      if (rejOtherSensor <= 3 || (rejOtherSensor % 200) == 0)
+        logEventS(LOG_WARN, "«Ramka obca - odrzucona|Foreign frame - rejected»: " + bytesToHex(frame, 28));
+      // BEZPIECZNIK - kryterium to BRAK PRZYJETYCH ramek, NIE liczba odrzuconych.
+      // Przy innych urzadzeniach 868 MHz odrzucen moze byc bardzo duzo i to jest
+      // normalne. Filtr wylaczamy tylko wtedy, gdy przez 5 minut nie przyjelismy
+      // ANI JEDNEJ naszej ramki - czyli prawdopodobnie zmienil sie nasz czujnik.
+      if (lastAcceptMs && (unsigned long)(millis() - lastAcceptMs) > 300000UL) {
+        vevIdFilter = false;
+        logEventS(LOG_WARN, "«Filtr czujnika WYLACZONY (5 min bez naszej ramki) - przyjmuje wszystko|Sensor filter DISABLED (5 min without our frame) - accepting all»");
+      }
+      return false;
     }
-    return false;
+    rejOtherSensor = 0;        // nasza ramka - licznik odrzucen sie zeruje
+    lastAcceptMs = millis();
   }
-  if (vevIdFilter) rejOtherSensor = 0;
 
   WeatherData w;
   if (!decodeVevor7in1(frame, 28, w)) return false;
@@ -2372,6 +2381,7 @@ void loadRxMode() {
   afcFreqMhz = modePrefs.getFloat("afcFreq", 868.42f);
   if (afcFreqMhz < AFC_MIN_MHZ || afcFreqMhz > AFC_MAX_MHZ) afcFreqMhz = 868.42f;
   afcBaseMhz = afcFreqMhz;   // punkt odniesienia dla przeszukiwania
+  lastAcceptMs = millis();   // start licznika bezpiecznika filtra czujnika
   modePrefs.end();
 }
 
