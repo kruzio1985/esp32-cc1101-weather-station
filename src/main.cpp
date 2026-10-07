@@ -214,6 +214,23 @@ unsigned long afcLastSaveMs  = 0;
 
 const float AFC_DAMPING     = 0.5f;       // jaka czesc odchylenia korygowac na jedna ramke
 const float AFC_STEP_MAX_HZ = 8000.0f;    // maksymalny krok na jedna ramke
+// BRAMKA WIARYGODNOSCI OKNA (2026-10-07). Mediana chroni przed pojedynczym szumem, ale nie
+// przed tym, ze cale okno jest szumne. Zmierzone po restarcie: surowe odchylenia skakaly
+// -26977 -> -23803 -> -19042 -> +19042 Hz, przez co automat wykonal dwie korekty po +8 kHz
+// (maksymalny krok) w zla strone i przez ~5 minut odbior byl gorszy, zanim wrocil do
+// 868.3542 MHz. Dlatego korygujemy TYLKO na pelnym oknie (5 probek) i tylko wtedy, gdy
+// typowy rozrzut pomiarow (MAD) jest maly.
+// UWAGA - ZMIERZONA WPADKA: pierwsza wersja bramki uzywala rozrzutu max-min. Jeden odczyt
+// +107910 Hz trzymal "rozrzut" 125 kHz przez kilka kolejnych ramek i ZABIL automat
+// (afcUpdates=0, afcSkips roslo, czestotliwosc stala w miejscu), choc pozostale probki byly
+// spojne okolo -15 kHz. MAD (mediana odchylen od mediany) ignoruje pojedyncze odpady.
+// BEZPIECZNIK: po AFC_SKIP_FAILOPEN odrzutach Z RZEDU korygujemy mimo wszystko, zeby automat
+// nie mogl sie trwale wylaczyc i udawac spokojnego (ta sama lekcja co przy filtrze czujnika).
+const int   AFC_MAD_MAX_HZ    = 12000;  // max typowy rozrzut (MAD) okna, zeby ufac pomiarom
+const int   AFC_SKIP_FAILOPEN = 10;     // po tylu odrzutach z rzedu korygujemy mimo wszystko
+int   afcMadHz      = 0;        // diagnostyka: MAD ostatniego okna (mediana odchylen)
+uint32_t afcSkips   = 0;        // ile korekt odrzucono (okno niepelne / rozrzut za duzy)
+int   afcSkipRow    = 0;        // ile odrzutow z rzedu (bezpiecznik fail-open)
 // FREQEST jest SZUMNY na marginalnych ramkach - zmierzono skoki +46 kHz, -43 kHz,
 // +135 kHz miedzy kolejnymi ramkami. Dlatego nie ufamy pojedynczemu odczytowi:
 // bierzemy MEDIANE z 5 ostatnich pomiarow. Inaczej automat szarpie odbiornikiem
@@ -2414,6 +2431,13 @@ void afcSave() {
   modePrefs.end();
 }
 
+// Sortowanie babelkowe malej tablicy (5 elementow) - uzywane dwa razy w afcOnFrame.
+static void afcSort(int* a, int n) {
+  for (int i = 0; i < n - 1; i++)
+    for (int j = 0; j < n - 1 - i; j++)
+      if (a[j] > a[j + 1]) { int t = a[j]; a[j] = a[j + 1]; a[j + 1] = t; }
+}
+
 // Wywolywane po KAZDEJ poprawnej ramce: czyta FREQEST i przesuwa srodek pasma tak,
 // zeby odbiornik jechal za czujnikiem (dryf termiczny ~17 kHz/st. C).
 void afcOnFrame() {
@@ -2438,13 +2462,30 @@ void afcOnFrame() {
   afcHist[afcHistIdx] = (int)offHz;
   afcHistIdx = (afcHistIdx + 1) % AFC_HIST_N;
   if (afcHistN < AFC_HIST_N) afcHistN++;
-  if (afcHistN < 3) return;                    // za malo probek na wiarygodna mediane
+
+  // Sortujemy TYLKO zebrane probki. Wczesniej sortowala sie cala tablica wraz z pustymi
+  // zerami, wiec mediana z niepelnego okna byla przekrzywiona i "ciagnela" ku zeru.
   int tmp[AFC_HIST_N];
-  for (int i = 0; i < AFC_HIST_N; i++) tmp[i] = afcHist[i];
-  for (int i = 0; i < AFC_HIST_N - 1; i++)
-    for (int j = 0; j < AFC_HIST_N - 1 - i; j++)
-      if (tmp[j] > tmp[j + 1]) { int t = tmp[j]; tmp[j] = tmp[j + 1]; tmp[j + 1] = t; }
-  offHz = (float)tmp[AFC_HIST_N / 2];
+  for (int i = 0; i < afcHistN; i++) tmp[i] = afcHist[i];
+  afcSort(tmp, afcHistN);
+
+  if (afcHistN < AFC_HIST_N) { afcSkips++; afcSkipRow++; return; }   // czekamy na pelne okno
+
+  int med = tmp[AFC_HIST_N / 2];
+
+  // MAD: mediana odchylen od mediany. Odporna na pojedyncze odpady - w odroznieniu od
+  // rozrzutu max-min (patrz komentarz przy AFC_MAD_MAX_HZ).
+  int dev[AFC_HIST_N];
+  for (int i = 0; i < AFC_HIST_N; i++) { int d = tmp[i] - med; dev[i] = (d < 0) ? -d : d; }
+  afcSort(dev, AFC_HIST_N);
+  afcMadHz = dev[AFC_HIST_N / 2];
+
+  if (afcMadHz > AFC_MAD_MAX_HZ && afcSkipRow < AFC_SKIP_FAILOPEN) {
+    afcSkips++; afcSkipRow++;
+    return;                                    // pomiary niestabilne - stoimy w miejscu
+  }
+  afcSkipRow = 0;
+  offHz = (float)med;
 
   float step = offHz * AFC_DAMPING / 1e6f;     // tlumienie: nie skaczemy na raz o calosc
   const float lim = AFC_STEP_MAX_HZ / 1e6f;
@@ -4978,6 +5019,8 @@ void handleStatus() {
   j += "\"afcFreqMhz\":" + String(afcFreqMhz, 4) + ",";
   j += "\"afcOffsetHz\":" + String(afcOffsetHz) + ",";
   j += "\"afcUpdates\":" + String(afcUpdates) + ",";
+  j += "\"afcMadHz\":" + String(afcMadHz) + ",";
+  j += "\"afcSkips\":" + String(afcSkips) + ",";
   j += "\"afcAuto\":" + String(freqOverride ? "false" : "true") + ",";
   j += "\"rejImplausible\":" + String(rejImplausible) + ",";
   j += "\"rejOtherSensor\":" + String(rejOtherSensor) + ",";
