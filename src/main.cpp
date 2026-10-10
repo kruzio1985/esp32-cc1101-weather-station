@@ -172,6 +172,14 @@ void publishWeather();
   #define PIN_GDO2 6
 #endif
 
+// Watchdog sprzetowy (opcjonalny): pin "zycia" 1 Hz.
+// Zewnetrzny modul watchdog (przekaznik / uklad z licznikiem) podaje zasilanie
+// dalej tylko wtedy, gdy na tym pinie pojawiaja sie impulsy. Gdy firmware sie
+// zawiesi - impulsy znikaja i modul ODCINA zasilanie na chwile. Tego nie da sie
+// zrobic z programu: zawieszony program nie wykona ESP.restart().
+// Wlaczanie/wylaczanie + godzina restartu dobowego: strona /setup.
+#define PIN_WD_HB 25
+
 // ==================== PARAMETRY SKANOWANIA ====================
 const unsigned long COMBO_DWELL_MS = 1000;  // czas na kombinację (freq x profil)
 const int RSSI_THRESHOLD   = -95;            // poniżej = szum, nie zapisuj
@@ -253,6 +261,8 @@ float afcBaseMhz     = 868.42f;         // punkt odniesienia przeszukiwania
 
 void afcOnFrame();   // wywolywane po kazdej poprawnej ramce (definicja nizej)
 void afcSave();      // zapis do NVS (definicja nizej - potrzebne Preferences)
+String autoRestartInfo();   // opis restartu dobowego (definicja nizej - uzywany w /setup)
+void applyWatchdogPin();    // wlaczenie/wylaczenie pinu zycia (uzywane w /savesys)
 
 // ==================== FILTR CZUJNIKA (numer seryjny) ====================
 // Protokol VEVOR nie ma sumy kontrolnej. Zmierzone 2026-10-06 w logu: w zasiegu
@@ -2392,6 +2402,44 @@ void saveCalCfg() {
   calPrefs.end();
 }
 
+// ---------- NVS: restart dobowy + pin zycia (namespace "sys") ----------
+// Po co restart dobowy: przez kilka dni pracy narasta fragmentacja sterty, stan
+// stosu WiFi i rozne liczniki. Restart raz na dobe (w nocy, gdy nikt nie patrzy)
+// czysci to wszystko taniej niz szukanie przyczyny pozniejszych dziwactw.
+// UWAGA: po restarcie liczniki od startu (przyjete/obce ramki) zeruja sie -
+// historia zostaje w /zdrowie.log, gdzie kazdy restart dobowy jest zapisywany.
+struct SysCfg {
+  bool autoRestart = true;   // restart dobowy wlaczony
+  int  restartHour = 4;      // godzina 0..23 czasu lokalnego
+  bool wdHeartbeat = false;  // pin zycia dla zewnetrznego watchdoga
+};
+SysCfg sysCfg;
+Preferences sysPrefs;
+
+void loadSysCfg() {
+  sysPrefs.begin("sys", false);
+  if (!sysPrefs.getBool("init", false)) {
+    sysPrefs.putBool("arEn", true);
+    sysPrefs.putInt("arHour", 4);
+    sysPrefs.putBool("wdHb", false);
+    sysPrefs.putBool("init", true);
+  }
+  sysCfg.autoRestart = sysPrefs.getBool("arEn", true);
+  sysCfg.restartHour = sysPrefs.getInt("arHour", 4);
+  sysCfg.wdHeartbeat = sysPrefs.getBool("wdHb", false);
+  if (sysCfg.restartHour < 0)  sysCfg.restartHour = 0;
+  if (sysCfg.restartHour > 23) sysCfg.restartHour = 23;
+  sysPrefs.end();
+}
+
+void saveSysCfg() {
+  sysPrefs.begin("sys", false);
+  sysPrefs.putBool("arEn", sysCfg.autoRestart);
+  sysPrefs.putInt("arHour", sysCfg.restartHour);
+  sysPrefs.putBool("wdHb", sysCfg.wdHeartbeat);
+  sysPrefs.end();
+}
+
 void loadSendCfg() {
   sendPrefs.begin("send", false);
   if (!sendPrefs.getBool("init", false)) {
@@ -3737,6 +3785,47 @@ void handleSetup() {
     </div>
     <button type="submit">«Zapisz i zastosuj|Save and apply»</button>
   </form>
+  <form method="post" action="/savesys">
+    <div class="card">
+      <h2>«Restart dobowy i watchdog sprzetowy|Daily restart and hardware watchdog»</h2>
+      <div class="row">
+        <input type="checkbox" name="arEnabled" id="arEnabled" )";
+  h += sysCfg.autoRestart ? "checked" : "";
+  h += R"(>
+        <label for="arEnabled">«Restartuj codziennie w nocy|Restart daily at night»</label>
+      </div>
+      <div class="grid">
+        <div><label>«Godzina restartu|Restart hour»</label>
+        <select name="arHour" style="width:100%;max-width:200px;padding:8px;border-radius:6px;border:1px solid #0f3460;background:#0f1b3d;color:#eee;font-size:0.95em">
+)";
+  for (int i = 0; i < 24; i++) {
+    h += "<option value=\"" + String(i) + "\"";
+    if (sysCfg.restartHour == i) h += " selected";
+    h += ">";
+    if (i < 10) h += "0";
+    h += String(i) + ":00</option>";
+  }
+  h += R"(
+        </select></div>
+      </div>
+      <div class="hint">«Restart wykonuje sie raz na dobe, w pierwszych 10 minutach wybranej godziny, nie wczesniej niz 15 minut po poprzednim starcie. Czestotliwosc odbioru (AFC) jest zapisywana przed restartem, wiec odbior wraca na tej samej czestotliwosci. Liczniki "od startu" zeruja sie - historia zostaje w /zdrowie.log.|The restart runs once a day, within the first 10 minutes of the chosen hour, at least 15 minutes after the previous boot. The AFC frequency is saved first, so reception resumes on the same frequency. Counters since boot reset - history stays in /zdrowie.log.»</div>
+      <div class="row">
+        <input type="checkbox" name="wdHeartbeat" id="wdHeartbeat" )";
+  h += sysCfg.wdHeartbeat ? "checked" : "";
+  h += R"(>
+        <label for="wdHeartbeat">«Pin zycia dla zewnetrznego modulu watchdog (GPIO|Heartbeat pin for an external watchdog module (GPIO)» )";
+  h += String(PIN_WD_HB);
+  h += R"()</label>
+      </div>
+      <div class="hint">«Pin daje impulsy 1 Hz, dopoki firmware zyje. Zewnetrzny modul watchdog odcina zasilanie, gdy impulsy znikna - to jedyny sposob na restart po TWARDYM zawieszeniu (zawieszony program nie wykona restartu z kodu). Domyslnie wylaczone.|The pin pulses at 1 Hz while the firmware is alive. An external watchdog module cuts power when the pulses stop - the only recovery from a HARD hang. Disabled by default.»</div>
+      <div class="hint">«Stan|State»: )";
+  h += autoRestartInfo();
+  h += R"( · «praca|uptime»: )";
+  h += String((millis() - startTime) / 60000);
+  h += R"( «min|min»</div>
+      <button type="submit">«Zapisz|Save»</button>
+    </div>
+  </form>
   <p style="margin-top:14px; color:#666; font-size:0.85em">
     Po zapisaniu urzadzenie przełączy sieć. Punkt dostepowy dziala zawsze - domyslnie pod adresem 192.168.4.1.
   </p>
@@ -4020,6 +4109,30 @@ void handleMqtt() {
   </form>)";
   h += cfgPageEnd();
   server.send(200, "text/html", h);
+}
+
+void handleSaveSys() {
+  sysCfg.autoRestart = server.hasArg("arEnabled");
+  if (server.hasArg("arHour")) {
+    int hr = server.arg("arHour").toInt();
+    if (hr < 0)  hr = 0;
+    if (hr > 23) hr = 23;
+    sysCfg.restartHour = hr;
+  }
+  sysCfg.wdHeartbeat = server.hasArg("wdHeartbeat");
+  saveSysCfg();
+  applyWatchdogPin();
+  logEventS(LOG_INFO, "«Ustawienia restartu dobowego zapisane|Daily restart settings saved»: " +
+                     String(sysCfg.autoRestart ? "wl." : "wyl.") + " " + String(sysCfg.restartHour) + ":00");
+
+  String msg = cfgPageStart("«Zapisano|Saved»", "✅ «Restart dobowy zapisany|Daily restart saved»");
+  msg += R"(<div class="msg">)";
+  msg += "«Restart dobowy|Daily restart»: " + autoRestartInfo();
+  msg += "<br>«Pin zycia|Heartbeat pin»: ";
+  msg += sysCfg.wdHeartbeat ? ("GPIO " + String(PIN_WD_HB) + " («1 Hz|1 Hz»)") : String("«wylaczony|off»");
+  msg += R"(<br><a href="/setup">«Wróć do ustawień|Back to settings»</a> · <a href="/">«Odczyt|Reading»</a></div>)";
+  msg += cfgPageEnd();
+  server.send(200, "text/html", msg);
 }
 
 void handleSaveCal() {
@@ -5111,6 +5224,11 @@ void handleStatus() {
   j += "\"hangResets\":" + String(rtcHangResets) + ",";
   j += "\"watchdogEnabled\":" + String(wdtEnabled ? "true" : "false") + ",";
   j += "\"wdtTimeoutS\":" + String(WDT_TIMEOUT_S) + ",";
+  j += "\"autoRestart\":" + String(sysCfg.autoRestart ? "true" : "false") + ",";
+  j += "\"autoRestartHour\":" + String(sysCfg.restartHour) + ",";
+  j += "\"autoRestartInfo\":\"" + stripLang(autoRestartInfo()) + "\",";
+  j += "\"wdHeartbeat\":" + String(sysCfg.wdHeartbeat ? "true" : "false") + ",";
+  j += "\"wdHeartbeatPin\":" + String(PIN_WD_HB) + ",";
   j += "\"wifiSleep\":" + String(gWifiSleepOn ? "true" : "false") + ",";
   j += "\"afcFreqMhz\":" + String(afcFreqMhz, 4) + ",";
   j += "\"afcOffsetHz\":" + String(afcOffsetHz) + ",";
@@ -5237,6 +5355,73 @@ void handleErrTest() {
 // ==================== SYNCHRONIZACJA CZASU (NTP) ====================
 // Potrzebna, żeby wpisy w pliku błędów miały prawdziwą datę i żeby działało
 // kasowanie wpisów starszych niż 7 dni.
+// ==================== RESTART DOBOWY + PIN ZYCIA WATCHDOGA ====================
+// Pin zycia: przelaczany co 500 ms (0,5 Hz na wyjsciu = zmiana stanu 1 Hz).
+void serviceWatchdogHeartbeat() {
+  if (!sysCfg.wdHeartbeat) return;
+  static unsigned long last = 0;
+  static bool state = false;
+  unsigned long now = millis();
+  if (now - last < 500) return;
+  last = now;
+  state = !state;
+  digitalWrite(PIN_WD_HB, state ? HIGH : LOW);
+}
+
+// Wlaczenie/wylaczenie pinu zycia. Wylaczony pin zostawiamy jako wejscie, zeby
+// nie sterowal niczym, gdy funkcja jest nieuzywana.
+void applyWatchdogPin() {
+  if (sysCfg.wdHeartbeat) {
+    pinMode(PIN_WD_HB, OUTPUT);
+    digitalWrite(PIN_WD_HB, LOW);
+  } else {
+    pinMode(PIN_WD_HB, INPUT);
+  }
+}
+
+// Opis stanu do /setup i /status: "wlaczony 04:00 (za 5 h 12 min)".
+String autoRestartInfo() {
+  if (!sysCfg.autoRestart) return "«wylaczony|disabled»";
+  String s = "«wlaczony|enabled» ";
+  if (sysCfg.restartHour < 10) s += "0";
+  s += String(sysCfg.restartHour) + ":00";
+  time_t now = time(nullptr);
+  if (now > 1700000000) {          // czas sensowny (po synchronizacji NTP)
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    int d = sysCfg.restartHour * 60 - (tmv.tm_hour * 60 + tmv.tm_min);
+    if (d < 0) d += 1440;
+    s += " («za|in») " + String(d / 60) + " h " + String(d % 60) + " min";
+  }
+  return s;
+}
+
+// Restart dobowy. Okno: pierwsze 10 minut wybranej godziny. To wazne - bez okna
+// urzadzenie po restarcie o 04:00 znow zobaczyloby godzine 04:00 i restartowalo
+// sie w kolko. Dodatkowo wymagamy min. 15 minut pracy od startu, zeby swiezy
+// start (np. po zaniku zasilania) nigdy nie konczyl sie kolejnym restartem.
+void autoRestartGuard() {
+  if (!sysCfg.autoRestart) return;
+  if (Update.isRunning()) return;                                     // trwa OTA - nie przerywac
+  if ((unsigned long)(millis() - startTime) < 900000UL) return;       // min. 15 min pracy
+  time_t now = time(nullptr);
+  if (now < 1700000000) return;                                       // brak synchronizacji czasu
+  struct tm tmv;
+  localtime_r(&now, &tmv);
+  if (tmv.tm_hour != sysCfg.restartHour) return;
+  if (tmv.tm_min > 9) return;
+
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tmv);
+  logEventS(LOG_WARN, "«Restart dobowy (zaplanowany)|Scheduled daily restart» " + String(buf));
+  healthAppend("restart dobowy: " + String(buf) + " (up=" + String((millis() - startTime) / 1000) + "s)");
+  afcSave();          // zapisz dostrojenie, zeby po restarcie nie zbiegac od zera
+  Serial.printf("RESTART DOBOWY: %s (godzina %d), wracam na %.4f MHz\n",
+                buf, sysCfg.restartHour, afcFreqMhz);
+  delay(300);
+  ESP.restart();
+}
+
 void timeBegin() {
   // Strefa czasowa Polski (CET/CEST) - automatyczna zmiana czasu.
   configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
@@ -5399,7 +5584,9 @@ void setup() {
     Serial.print("..");
     Serial.println(filterCfg.maxLen);
   }
-  // Kalibracja / wysyłanie / MQTT
+  // Restart dobowy / pin zycia / kalibracja / wysyłanie / MQTT
+  loadSysCfg();
+  applyWatchdogPin();
   loadCalCfg();
   loadSendCfg();
   applySend();
@@ -5435,6 +5622,7 @@ void setup() {
   server.on("/send", handleSend);
   server.on("/mqtt", handleMqtt);
   server.on("/savecal", handleSaveCal);
+  server.on("/savesys", handleSaveSys);
   server.on("/savesend", handleSaveSend);
   server.on("/savemqtt", handleSaveMqtt);
   server.on("/sendtest", handleSendTest);
@@ -5488,6 +5676,11 @@ void loop() {
   if (heapNow < statHeapMin) statHeapMin = heapNow;
 
   wdtFeed();
+
+  // Restart dobowy + pin zycia dla zewnetrznego watchdoga. Celowo PRZED
+  // wczesnymi powrotami trybow probe/capture - maja dzialac zawsze.
+  serviceWatchdogHeartbeat();
+  autoRestartGuard();
 
   server.handleClient();
 
