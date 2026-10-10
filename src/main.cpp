@@ -278,6 +278,37 @@ unsigned long lastAcceptMs = 0;   // kiedy ostatnio PRZYJELISMY nasza ramke
 uint8_t  lastTail[6]    = {0, 0, 0, 0, 0, 0};
 bool     lastTailSet    = false;
 
+// --- BLOKADA JEDNEGO CZUJNIKA (2026-10-10) ---
+// Poprzednia wersja po 5 minutach bez naszej ramki WYLACZALA filtr na stale
+// (do restartu). Skutek widoczny w logu stacji: do kanalow VEVOR zaczely
+// wchodzic ramki SASIEDNIEJ stacji (13,9 C / 48 % / 24313 lx / UV 1 /
+// wiatr 15,01 m/s), a o 03:10 w nocy stacja pokazywala "24313 lx i UV 1".
+// Teraz filtr NIE wylacza sie sam: przez caly czas przyjmowany jest DOKLADNIE
+// JEDEN numer seryjny. Zmiana nastepuje tylko po realnej wymianie czujnika:
+// brak naszej ramki przez 5 minut ORAZ ten sam nowy numer SENSOR_SWITCH_FRAMES
+// razy z rzedu. Powrot naszego numeru dziala natychmiast.
+const int SENSOR_SWITCH_FRAMES = 10;
+uint8_t  activeTail[6]    = { 0xd8, 0x6b, 0x25, 0x65, 0xd1, 0x96 };  // = VEV_ID
+uint8_t  candidateTail[6] = {0, 0, 0, 0, 0, 0};
+uint16_t candidateCount   = 0;
+uint16_t sensorSwitches   = 0;      // ile razy zmienil sie przyjmowany czujnik
+
+// Numer seryjny czujnika (6 bajtow ogona ramki) jako 12 znakow hex.
+String tailHex(const uint8_t* d) {
+  String h;
+  h.reserve(12);
+  for (int i = 0; i < 6; i++) {
+    if (d[i] < 16) h += "0";
+    h += String(d[i], HEX);
+  }
+  return h;
+}
+
+// Progi skoku swiatla/UV miedzy dwiema ramkami (~20 s). Realny wschod slonca
+// to najwyzej kilkaset lx na ramke, wiec 25 000 lx ma duzy zapas.
+const float LIGHT_JUMP_MAX_LUX = 25000.0f;
+const int   UV_JUMP_MAX        = 3;
+
 // ==================== PROFILE MODEMU ====================
 // Kolumny: MDMCFG4, MDMCFG3, MDMCFG2 (MOD_FORMAT, SYNC_MODE=0), DEVIATN
 static const char* PROF_NAMES[] = {
@@ -1378,7 +1409,9 @@ void rxStallGuard() {
 // Wywolywana z dwoch sciezek (bezposredniej i awaryjnej), zeby uniknac duplikacji.
 bool handleVevorFrame(uint8_t* frame, int rssi) {
   // --- Filtr czujnika: ostatnie 6 bajtow ramki to numer seryjny. Przyjmujemy
-  // tylko nasz (patrz VEV_ID). Obcy czujnik w okolicy podawal bzdury.
+  // ramki TYLKO JEDNEGO numeru (activeTail - domyslnie nasz, patrz VEV_ID).
+  // Obcy czujnik w okolicy podaje bzdury (24313 lx / UV 1 / 15 m/s) i nigdy nie
+  // moze dostac sie na wyjscie razem z naszym.
   uint8_t* tail6 = frame + 22;
   if (!lastTailSet || memcmp(tail6, lastTail, 6) != 0) {
     for (int i = 0; i < 6; i++) lastTail[i] = tail6[i];
@@ -1386,29 +1419,46 @@ bool handleVevorFrame(uint8_t* frame, int rssi) {
     lastTailSet = true;
   }
   if (vevIdFilter) {
-    // Nasza ramka = numer seryjny ORAZ stala czesc naglowka (bajty 4-5 = 10 02
-    // w kazdej zaobserwowanej ramce naszego czujnika). W budynku pracuja inne
-    // urzadzenia 868 MHz i NIE DA SIE ich usunac - dlatego odsiewamy je tutaj,
-    // w oprogramowaniu, po tresci ramki.
-    bool ours = (memcmp(tail6, VEV_ID, 6) == 0) && frame[4] == 0x10 && frame[5] == 0x02;
-    if (!ours) {
-      rejectedFrames++;
-      rejOtherSensor++;
-      obceLacznie++;
-      diagPush(frame, 28, rssi, false);
-      if (rejOtherSensor <= 3 || (rejOtherSensor % 200) == 0)
-        logEventS(LOG_WARN, "«Ramka obca - odrzucona|Foreign frame - rejected»: " + bytesToHex(frame, 28));
-      // BEZPIECZNIK - kryterium to BRAK PRZYJETYCH ramek, NIE liczba odrzuconych.
-      // Przy innych urzadzeniach 868 MHz odrzucen moze byc bardzo duzo i to jest
-      // normalne. Filtr wylaczamy tylko wtedy, gdy przez 5 minut nie przyjelismy
-      // ANI JEDNEJ naszej ramki - czyli prawdopodobnie zmienil sie nasz czujnik.
-      if (lastAcceptMs && (unsigned long)(millis() - lastAcceptMs) > 300000UL) {
-        vevIdFilter = false;
-        logEventS(LOG_WARN, "«Filtr czujnika WYLACZONY (5 min bez naszej ramki) - przyjmuje wszystko|Sensor filter DISABLED (5 min without our frame) - accepting all»");
+    // Naglowek (bajty 4-5 = 10 02) jest taki sam w calej rodzinie, wiec czujnik
+    // rozpoznajemy po numerze seryjnym z ogona ramki.
+    bool headerOk = (frame[4] == 0x10 && frame[5] == 0x02);
+    if (!headerOk || memcmp(tail6, activeTail, 6) != 0) {
+      // Nasz numer zjawil sie znowu - natychmiast wracamy do niego, nawet gdy
+      // pracowalismy na czujniku zapasowym.
+      if (headerOk && memcmp(tail6, VEV_ID, 6) == 0 && memcmp(activeTail, VEV_ID, 6) != 0) {
+        memcpy(activeTail, VEV_ID, 6);
+        candidateCount = 0;
+        sensorSwitches++;
+        logEventS(LOG_WARN, "«Czujnik: powrot do naszego numeru|Sensor: back to our serial» " + tailHex(activeTail));
+      } else {
+        rejectedFrames++;
+        rejOtherSensor++;
+        obceLacznie++;
+        diagPush(frame, 28, rssi, false);
+        if (rejOtherSensor <= 3 || (rejOtherSensor % 200) == 0)
+          logEventS(LOG_WARN, "«Ramka obca - odrzucona|Foreign frame - rejected»: " + bytesToHex(frame, 28));
+        // Zmiana czujnika (realna wymiana): kryterium to BRAK PRZYJETYCH ramek,
+        // a nie liczba odrzuconych - w budynku pracuje wiele urzadzen 868 MHz.
+        // Wymagamy dodatkowo, zeby ten sam obcy numer powtorzyl sie wielokrotnie,
+        // dzieki czemu jedna uszkodzona ramka nie przejmie odbioru.
+        bool noOurFrames = lastAcceptMs && (unsigned long)(millis() - lastAcceptMs) > 300000UL;
+        if (noOurFrames) {
+          if (memcmp(tail6, candidateTail, 6) == 0) candidateCount++;
+          else { memcpy(candidateTail, tail6, 6); candidateCount = 1; }
+          if (candidateCount >= SENSOR_SWITCH_FRAMES) {
+            memcpy(activeTail, candidateTail, 6);
+            candidateCount = 0;
+            sensorSwitches++;
+            logEventS(LOG_WARN, "«Czujnik: nowy numer seryjny (wymiana czujnika)|Sensor: new serial (sensor replaced)» " + tailHex(activeTail));
+          }
+        } else {
+          candidateCount = 0;
+        }
       }
       return false;
     }
     rejOtherSensor = 0;        // nasza ramka - licznik odrzucen sie zeruje
+    candidateCount = 0;
     lastAcceptMs = millis();
   }
 
@@ -1432,6 +1482,42 @@ bool handleVevorFrame(uint8_t* frame, int rssi) {
     logEventS(LOG_WARN, "«Ramka odrzucona - nierealne dane|Frame rejected - implausible data»: " + bytesToHex(frame, 28));
     Serial.println("VEVOR: ramka odrzucona (nierealne dane)");
     return false;
+  }
+
+  // --- Swiatlo i UV: druga linia obrony przed pojedyncza bledna ramka.
+  // Skok wiekszy, niz fizycznie mozliwy w 20 s (np. 0 -> 24313 lx w nocy),
+  // publikujemy dopiero, gdy powtorzy sie w nastepnej ramce. Do tego czasu
+  // wysylamy ramke BEZ swiatla/UV, zeby stacja zachowala poprzednia wartosc
+  // zamiast wpisac bzdure. Podstawowa ochrona jest blokada numeru seryjnego.
+  if (w.haveLight) {
+    static float pendLux = -1.0f;
+    static int   pendLuxCnt = 0;
+    bool jump = lastWeatherValid && lastWeather.haveLight &&
+                fabsf(w.lightLux - lastWeather.lightLux) > LIGHT_JUMP_MAX_LUX;
+    if (jump && !(pendLuxCnt > 0 && fabsf(w.lightLux - pendLux) < 1000.0f)) {
+      pendLux = w.lightLux;
+      pendLuxCnt++;
+      w.haveLight = false;
+      if (pendLuxCnt == 1)
+        logEventS(LOG_WARN, "«Skok swiatla wstrzymany do potwierdzenia|Light jump held for confirmation»: " + String(w.lightLux, 0) + " lux");
+    } else {
+      pendLuxCnt = 0;
+    }
+  }
+  if (w.haveUv) {
+    static int pendUvi = -1;
+    static int pendUviCnt = 0;
+    bool jump = lastWeatherValid && lastWeather.haveUv &&
+                abs(w.uvi - lastWeather.uvi) > UV_JUMP_MAX;
+    if (jump && !(pendUviCnt > 0 && w.uvi == pendUvi)) {
+      pendUvi = w.uvi;
+      pendUviCnt++;
+      w.haveUv = false;
+      if (pendUviCnt == 1)
+        logEventS(LOG_WARN, "«Skok UV wstrzymany do potwierdzenia|UV jump held for confirmation»: " + String(w.uvi));
+    } else {
+      pendUviCnt = 0;
+    }
   }
 
   totalFrames++;
@@ -1960,6 +2046,13 @@ void loopAuto() {
       break;
     case 2:
       ok = decodeVevor7in1(frame, need, w);
+      // W trybie AUTO obowiazuje ta sama blokada numeru seryjnego co w trybie
+      // VEVOR - bez tego skan przepuszczalby na wyjscie obca stacje (m.in.
+      // 24313 lx i UV 1 w nocy).
+      if (ok && vevIdFilter && need >= 28 && memcmp(frame + 22, activeTail, 6) != 0) {
+        ok = false;
+        obceLacznie++;
+      }
       break;
     default:
       if (frame[0] == 0xD4) {
@@ -3268,6 +3361,7 @@ void handleJson() {
   json += "\"filterPattern\":\"" + filterCfg.pattern + "\",";
   // Filtr po numerze seryjnym VEVOR - ODRĘBNY od "filterPattern" powyżej.
   json += "\"vevIdFilter\":" + String(vevIdFilter ? "true" : "false") + ",";
+  json += "\"vevSerial\":\"" + tailHex(activeTail) + "\",";
   json += "\"obceLacznie\":" + String(obceLacznie) + ",";
   json += "\"uptime\":" + String((millis() - startTime) / 1000) + ",";
 
@@ -4693,6 +4787,8 @@ void healthGuard() {
   s += " heap=" + String(ESP.getFreeHeap());
   s += " heapMin=" + String(statHeapMin);
   s += " maxLoop=" + String(statMaxLoopMs) + "ms";
+  s += " recon=" + String(statWifiRecon);
+  s += " czujnik=" + tailHex(activeTail);
   healthAppend(s);
 }
 
@@ -5027,6 +5123,8 @@ void handleStatus() {
   j += "\"obceLacznie\":" + String(obceLacznie) + ",";
   j += "\"fifoOverflow\":" + String(statFifoOverflow) + ",";
   j += "\"vevIdFilter\":" + String(vevIdFilter ? "true" : "false") + ",";
+  j += "\"vevSerial\":\"" + tailHex(activeTail) + "\",";
+  j += "\"sensorSwitches\":" + String(sensorSwitches) + ",";
   j += "\"tailChanges\":" + String(tailChanges) + ",";
   j += "\"radioVersion\":" + String(ccStatusRead(0x31)) + ",";
   j += "\"radioOk\":" + String(ccStatusRead(0x31) == 0x14 ? "true" : "false") + ",";
@@ -5049,6 +5147,7 @@ void handleStatus() {
   j += "\"wifiIp\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("")) + "\",";
   j += "\"wifiApIp\":\"" + WiFi.softAPIP().toString() + "\",";
   j += "\"wifiRssi\":" + String(WiFi.RSSI()) + ",";
+  j += "\"wifiRecon\":" + String(statWifiRecon) + ",";
   if (lastWeatherValid) {
     j += "\"lastDataAgeSec\":" + String((millis() - lastWeather.t) / 1000) + ",";
   } else {
