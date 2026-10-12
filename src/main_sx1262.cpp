@@ -1,5 +1,6 @@
 // ============================================================================
-//  ODBIORNIK STACJI POGODOWEJ 868 MHz NA SX1262 (SPI) - ESP32-S2 Mini
+//  ODBIORNIK STACJI POGODOWEJ 868 MHz NA SX1262 (SPI)
+//  ESP32-S2 Mini  (env esp32-s2-sx1262)  ALBO  ESP32-C3  (env esp32-c3-sx1262)
 // ============================================================================
 //  Po co: CC1101 ma kwarc, ktory dryfuje (~100 kHz na dobe) i to byla glowna
 //  przyczyna przerw w odbiorze. SX1262 z TCXO ma stabilnosc ~0,5 ppm, wiec
@@ -21,8 +22,9 @@
 //  DEKODER jest ten sam plik co w wersji CC1101 (src/vevor.cpp) - nic sie nie
 //  zmienia w interpretacji danych, wiec dane do stacji glownej sa identyczne.
 //
-//  Budowa:  pio run -e esp32-s2-sx1262
-//  Wgranie: pio run -e esp32-s2-sx1262 -t upload
+//  Budowa:  pio run -e esp32-s2-sx1262      (S2 Mini)
+//           pio run -e esp32-c3-sx1262      (ESP32-C3)
+//  Wgranie: pio run -e <srodowisko> -t upload
 // ============================================================================
 
 #include <Arduino.h>
@@ -35,8 +37,23 @@
 #include <RadioLib.h>
 #include "decoders.h"
 
-// ==================== PINY (ESP32-S2 Mini) ====================
-// Piny 7-13 sa bezpieczne na S2 Mini. NIE uzywac: GPIO0 (BOOT), GPIO19/20 (USB),
+// ==================== PINY (ESP32-S2 Mini ALBO ESP32-C3) ====================
+// Wariant wybiera kompilator: srodowisko esp32-c3-sx1262 uzywa bloku C3,
+// esp32-s2-sx1262 bloku S2 Mini.
+#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(BOARD_C3_SX1262)
+// ESP32-C3: jeden SPI (FSPI) routowany przez macierz GPIO, wiec piny sa dowolne.
+// NIE uzywac: GPIO2/8/9 (strapping/BOOT), GPIO11-17 (flash w ukladzie),
+// GPIO18/19 (USB), GPIO20/21 (UART0). Uzyte 1/3/4/5/6/7/10 sa wolne
+// (dziala tez na popularnej plytce "ESP32-C3 Super Mini").
+#define PIN_SCK     4
+#define PIN_MISO    5
+#define PIN_MOSI    6
+#define PIN_NSS     7
+#define PIN_RST     3
+#define PIN_BUSY   10
+#define PIN_DIO1    1
+#else
+// ESP32-S2 Mini: piny 7-13 sa bezpieczne. NIE uzywac: GPIO0 (BOOT), GPIO19/20 (USB),
 // GPIO26-32 (flash), GPIO33-37 (PSRAM), GPIO15 (dioda LED na wiekszosci plytek).
 #define PIN_SCK    12
 #define PIN_MISO   13
@@ -45,6 +62,7 @@
 #define PIN_RST     9
 #define PIN_BUSY    8
 #define PIN_DIO1    7
+#endif
 
 // ==================== PARAMETRY RADIA ====================
 #define RF_FREQ_MHZ_DEF   868.350f   // srodek pasma (AFC w CC1101 zbiegal do 868,349-868,354)
@@ -557,7 +575,10 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println();
-  Serial.println("=== Odbiornik 868 MHz na SX1262 (ESP32-S2 Mini) ===");
+  Serial.println("=== Odbiornik 868 MHz na SX1262 (ESP32-S2 Mini / ESP32-C3) ===");
+  // Wydruk pinow - ulatwia weryfikacje lutowania na nowej plytce.
+  Serial.printf("Piny: SCK=%d MISO=%d MOSI=%d NSS=%d RST=%d BUSY=%d DIO1=%d\n",
+                PIN_SCK, PIN_MISO, PIN_MOSI, PIN_NSS, PIN_RST, PIN_BUSY, PIN_DIO1);
 
   startTime = millis();
   loadCfg();
