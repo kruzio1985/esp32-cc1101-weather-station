@@ -52,6 +52,17 @@
 #define PIN_RST     3
 #define PIN_BUSY   10
 #define PIN_DIO1    1
+#elif defined(BOARD_WROOM_SX1262)
+// Klasyczny ESP32 WROOM-32 (devkit 38-pin): VSPI na 18/19/23. NIE uzywac GPIO6-11
+// (flash w ukladzie), GPIO34-39 (tylko wejscia), GPIO0/2/12/15 (strapping).
+// NSS celowo NIE na GPIO5 - to sprzetowy CS0 magistrali VSPI (patrz 03_SPRZET_I_PINY.md).
+#define PIN_SCK    18
+#define PIN_MISO   19
+#define PIN_MOSI   23
+#define PIN_NSS    27
+#define PIN_RST    26
+#define PIN_BUSY   25
+#define PIN_DIO1    4
 #else
 // ESP32-S2 Mini: piny 7-13 sa bezpieczne. NIE uzywac: GPIO0 (BOOT), GPIO19/20 (USB),
 // GPIO26-32 (flash), GPIO33-37 (PSRAM), GPIO15 (dioda LED na wiekszosci plytek).
