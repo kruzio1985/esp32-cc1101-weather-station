@@ -1429,9 +1429,13 @@ bool handleVevorFrame(uint8_t* frame, int rssi) {
     lastTailSet = true;
   }
   if (vevIdFilter) {
-    // Naglowek (bajty 4-5 = 10 02) jest taki sam w calej rodzinie, wiec czujnik
+    // Naglowek rodziny: b[0]=0xAA (stala), b[1]=kind|kanal (0x00). Czujnik
     // rozpoznajemy po numerze seryjnym z ogona ramki.
-    bool headerOk = (frame[4] == 0x10 && frame[5] == 0x02);
+    // UWAGA: b[4] to FLAGA BATERII (bit7=1 = slaba), a b[5] to starszy bajt
+    // temperatury - te bajty NIE sa stale. Stara wersja wymagala b[4]=0x10
+    // i b[5]=0x02, wiec po oslabnieciu baterii (0x90) albo przy temperaturze
+    // spoza zakresu 1,2..26,7 C odrzucala WLASNE ramki jako obce.
+    bool headerOk = (frame[0] == 0xAA && frame[1] == 0x00);
     if (!headerOk || memcmp(tail6, activeTail, 6) != 0) {
       // Nasz numer zjawil sie znowu - natychmiast wracamy do niego, nawet gdy
       // pracowalismy na czujniku zapasowym.
@@ -1451,7 +1455,10 @@ bool handleVevorFrame(uint8_t* frame, int rssi) {
         // a nie liczba odrzuconych - w budynku pracuje wiele urzadzen 868 MHz.
         // Wymagamy dodatkowo, zeby ten sam obcy numer powtorzyl sie wielokrotnie,
         // dzieki czemu jedna uszkodzona ramka nie przejmie odbioru.
-        bool noOurFrames = lastAcceptMs && (unsigned long)(millis() - lastAcceptMs) > 300000UL;
+        // Kandydat na "nowy czujnik" musi byc poprawna ramka rodziny (naglowek),
+        // inaczej smieci z eteru przejmowaly numer po 5 min ciszy
+        // (w /zdrowie.log byl wpis czujnik=b73fcfad61c7 przy zerze przyjetych).
+        bool noOurFrames = headerOk && lastAcceptMs && (unsigned long)(millis() - lastAcceptMs) > 300000UL;
         if (noOurFrames) {
           if (memcmp(tail6, candidateTail, 6) == 0) candidateCount++;
           else { memcpy(candidateTail, tail6, 6); candidateCount = 1; }
