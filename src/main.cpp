@@ -2818,6 +2818,17 @@ void radioHealthCheck() {
 }
 
 // ==================== STRONA WWW ====================
+// Ikona zakladki (favicon) wbudowana jako data URI - zero dodatkowych plikow w flash
+// i zero zapytan HTTP. Wstawiana do <head> kazdej strony.
+static const char FAVICON_LINK[] =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,"
+  "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
+  "<rect width='32' height='32' rx='7' fill='%230d1117'/>"
+  "<path d='M16 26V13' stroke='%2300d9ff' stroke-width='3' stroke-linecap='round'/>"
+  "<path d='M9.5 9.5a9.5 9.5 0 0 1 13 0' fill='none' stroke='%2300d9ff' stroke-width='3' stroke-linecap='round'/>"
+  "<path d='M5.5 5.5a14 14 0 0 1 21 0' fill='none' stroke='%2300d9ff' stroke-width='2.2' stroke-linecap='round' opacity='.5'/>"
+  "</svg>\">";
+
 void handleRoot() {
   radioHealthCheck();
   String html = R"(
@@ -2826,7 +2837,11 @@ void handleRoot() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>868 MHz Weather Sniffer</title>
+  <title>«Radio 868 — odbiornik stacji pogodowej|Radio 868 — weather station receiver»</title>
+  <meta name="description" content="Radio 868 - odbiornik stacji pogodowej 868 MHz (ESP32 + CC1101). Dekoduje ramki czujnika VEVOR / Youtong 7-in-1 i udostepnia je jako JSON dla stacji glownej.">
+)";
+  html += FAVICON_LINK;
+  html += R"(
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -2929,6 +2944,7 @@ void handleRoot() {
       <span class="chip" id="tb-up">⏱ «Czas pracy|Uptime»: <b>—</b></span>
       <span class="chip" id="tb-heap">💾 RAM: <b>—</b></span>
     </div>
+    <p style="font-size:0.88em;color:#475569;margin:0 0 14px">📻 «Radio 868 — odbiornik stacji pogodowej VEVOR / Youtong 7-in-1 (ESP32 + CC1101). Ramki 868 MHz trafiają tutaj jako JSON dla stacji głównej.|Radio 868 — VEVOR / Youtong 7-in-1 weather station receiver (ESP32 + CC1101). 868 MHz frames arrive here as JSON for the main station.»</p>
     <div class="stat">
       <div class="stat-value mono" style="color:#ff6b6b">)";
   html += (rxMode == MODE_FINE_OFFSET)
@@ -5620,6 +5636,9 @@ void setup() {
   // Tu tylko synchronizacja czasu (dla dat w pliku błędów).
   timeBegin();
 
+  // Przegladarki i tak prosza o /favicon.ico - oddajemy 204, zeby nie zapychac
+  // pliku bledow. Wlasciwa ikona jest wbudowana w <head> stron (data URI).
+  server.on("/favicon.ico", []() { server.send(204, "text/plain", ""); });
   server.on("/", handleRoot);
   server.on("/json", handleJson);
   server.on("/clear", handleClear);
